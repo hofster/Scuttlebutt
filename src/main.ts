@@ -34,11 +34,15 @@ import {
 import {
 	buildMultipart,
 	calloutBlock,
+	extractAudioEmbeds,
+	extractCallout,
+	extractSummaryBody,
 	formatDuration,
 	joinUrl,
 	normalizeTag,
 	parseTagArray,
 	parseTranscriptResponse,
+	recordingStamp,
 	responseHasSpeakers,
 	sanitizeFileName,
 	sanitizeTitle,
@@ -243,6 +247,32 @@ class MeetingRecorder {
 	private audioContext: AudioContext | null = null;
 	private chunks: Blob[] = [];
 	private mimeType = 'audio/webm';
+	// Some systems need a moment to fully release a mic device after it's stopped;
+	// starting a new getUserMedia() too soon can silently yield an empty recording
+	// (observed when starting a second take right after the first, via "Add recording").
+	private lastStopAt = 0;
+	private static readonly MIN_GAP_MS = 1000;
+	// Set synchronously at the top of start(), before any await — closes the race where
+	// a second start() call (e.g. an impatient double-click) sees isRecording() still
+	// false (no MediaRecorder exists yet) and runs concurrently with the first, corrupting
+	// shared state so both end up with zero audio data.
+	private starting = false;
+
+	// Called if any input track ends unexpectedly while a recording is active — this
+	// has been observed in the wild (a track's readyState silently flips to 'ended'
+	// mid-recording, with zero further data, and no error thrown). We can't recover
+	// the lost audio, but we can tell the user right away instead of after a long
+	// silent recording.
+	onUnexpectedEnd: ((trackLabel: string) => void) | null = null;
+
+	static readonly ALREADY_STARTING = 'A recording is already starting or in progress.';
+
+	// Relative timestamps (ms since this recorder was created) — easier to eyeball
+	// elapsed time between log lines than raw epoch millis.
+	private readonly t0 = Date.now();
+	private log(...args: unknown[]): void {
+		console.debug(`[Scuttlebutt +${Date.now() - this.t0}ms]`, ...args);
+	}
 
 	isRecording(): boolean {
 		return this.mediaRecorder?.state === 'recording';
@@ -253,12 +283,44 @@ class MeetingRecorder {
 		systemAudioDeviceId?: string;
 		captureSystemAudio: boolean;
 	}): Promise<{ systemAudio: boolean }> {
+		if (this.starting || this.isRecording()) {
+			throw new Error(MeetingRecorder.ALREADY_STARTING);
+		}
+		this.starting = true;
+		try {
+			return await this.doStart(opts);
+		} finally {
+			this.starting = false;
+		}
+	}
+
+	private async doStart(opts: {
+		inputDeviceId?: string;
+		systemAudioDeviceId?: string;
+		captureSystemAudio: boolean;
+	}): Promise<{ systemAudio: boolean }> {
+		const sinceStop = Date.now() - this.lastStopAt;
+		if (this.lastStopAt > 0 && sinceStop < MeetingRecorder.MIN_GAP_MS) {
+			await new Promise((r) => window.setTimeout(r, MeetingRecorder.MIN_GAP_MS - sinceStop));
+		}
 		// Microphone — the base track. Mic processing (echo cancellation, noise
 		// suppression) is on; a system/loopback source below is captured raw so that
 		// processing doesn't gate it.
 		const micConstraints: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true };
 		if (opts.inputDeviceId) micConstraints.deviceId = { exact: opts.inputDeviceId };
 		const micStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: micConstraints });
+		this.log(
+			'mic acquired:',
+			micStream.getAudioTracks().map((t) => ({ label: t.label, readyState: t.readyState, muted: t.muted, enabled: t.enabled }))
+		);
+		for (const track of micStream.getAudioTracks()) {
+			track.addEventListener('ended', () => {
+				if (this.mediaRecorder?.state === 'recording') {
+					this.log('WARNING: track ended unexpectedly mid-recording:', track.label);
+					this.onUnexpectedEnd?.(track.label);
+				}
+			});
+		}
 		this.sources = [micStream];
 		let systemAudio = false;
 
@@ -305,10 +367,16 @@ class MeetingRecorder {
 
 		this.mediaRecorder = new MediaRecorder(this.stream, { mimeType: this.mimeType });
 		this.chunks = [];
+		const trackAtStart = this.stream.getAudioTracks()[0];
+		this.log('MediaRecorder constructed, mimeType =', this.mimeType, 'track live? ', trackAtStart?.readyState, trackAtStart?.muted ? '(muted)' : '(unmuted)');
 		this.mediaRecorder.ondataavailable = (e) => {
+			const t = this.stream?.getAudioTracks()[0];
+			this.log('ondataavailable, size =', e.data?.size ?? 0, 'recorder.state =', this.mediaRecorder?.state, 'track:', t?.readyState, t?.muted);
 			if (e.data && e.data.size > 0) this.chunks.push(e.data);
 		};
+		this.mediaRecorder.onerror = (e) => this.log('MediaRecorder onerror:', e);
 		this.mediaRecorder.start(1000);
+		this.log('mediaRecorder.start(1000) called, state =', this.mediaRecorder.state);
 		return { systemAudio };
 	}
 
@@ -327,10 +395,14 @@ class MeetingRecorder {
 	stop(): Promise<Blob> {
 		return new Promise((resolve) => {
 			if (!this.mediaRecorder) {
+				this.log('stop() called but mediaRecorder is null');
 				resolve(new Blob());
 				return;
 			}
+			const t = this.stream?.getAudioTracks()[0];
+			this.log('stop() called, recorder.state =', this.mediaRecorder.state, 'chunks so far =', this.chunks.length, 'track:', t?.readyState, t?.muted);
 			this.mediaRecorder.onstop = () => {
+				this.log('onstop fired, total chunks =', this.chunks.length, 'sizes =', this.chunks.map((c) => c.size));
 				const blob = new Blob(this.chunks, { type: this.mimeType });
 				this.cleanup();
 				resolve(blob);
@@ -360,6 +432,7 @@ class MeetingRecorder {
 		}
 		this.mediaRecorder = null;
 		this.chunks = [];
+		this.lastStopAt = Date.now();
 	}
 
 	abort() {
@@ -631,13 +704,19 @@ type SessionStatus =
 
 type ReviewTab = 'summary' | 'transcript' | 'memo';
 
-interface MeetingSession {
-	status: SessionStatus;
-	audioData: ArrayBuffer | null;
+interface AudioSegment {
+	id: string;
+	audioData: ArrayBuffer | null; // present until the clip is saved to the vault
 	audioMime: string;
 	audioName: string;
-	audioSourcePath: string | null; // set when imported from an existing vault file
-	transcript: string;
+	audioSourcePath: string | null; // vault path once saved, or the original import source
+	transcript: string; // this segment's own transcribed text
+}
+
+interface MeetingSession {
+	status: SessionStatus;
+	segments: AudioSegment[];
+	transcript: string; // combined view of every segment's transcript, editable by hand
 	memo: string;
 	participants: string[];
 	contextFiles: string[];
@@ -653,15 +732,13 @@ interface MeetingSession {
 	progressLabel: string;
 	progressPct: number;
 	savedNotePath: string | null;
+	liveNotePath: string | null; // note created at quick-start time; merged into the final note on save
 }
 
 function newSession(diarizeDefault = false): MeetingSession {
 	return {
 		status: 'idle',
-		audioData: null,
-		audioMime: 'audio/webm',
-		audioName: '',
-		audioSourcePath: null,
+		segments: [],
 		transcript: '',
 		memo: '',
 		participants: [],
@@ -678,6 +755,7 @@ function newSession(diarizeDefault = false): MeetingSession {
 		progressLabel: '',
 		progressPct: 0,
 		savedNotePath: null,
+		liveNotePath: null,
 	};
 }
 
@@ -713,10 +791,32 @@ class FileSuggestModal extends FuzzySuggestModal<TFile> {
 const VIEW_TYPE_SCUTTLEBUTT = 'scuttlebutt-view';
 const AUDIO_EXTENSIONS = ['webm', 'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'mp4', 'mpga', 'oga'];
 
+/**
+ * MediaRecorder-produced webm doesn't store its own duration, so Chromium reports
+ * Infinity/NaN until you seek — the transport shows "0:00" with no total time as a
+ * result. Seeking far past the end forces the browser to compute the real duration,
+ * then we reset the playhead to the start. Standard, widely-used workaround. Used both
+ * for the sidebar's own players and (via a markdown post-processor) for the audio
+ * embeds Obsidian renders inside the note itself.
+ */
+function fixMissingAudioDuration(player: HTMLAudioElement): void {
+	const check = () => {
+		if (player.duration !== Infinity && !Number.isNaN(player.duration)) return;
+		player.currentTime = 1e101;
+		const onTimeUpdate = () => {
+			player.removeEventListener('timeupdate', onTimeUpdate);
+			player.currentTime = 0;
+		};
+		player.addEventListener('timeupdate', onTimeUpdate);
+	};
+	if (player.readyState >= 1) check();
+	else player.addEventListener('loadedmetadata', check, { once: true });
+}
+
 class ScuttlebuttView extends ItemView {
 	private timer: number | null = null;
 	private timerEl: HTMLElement | null = null;
-	private audioUrl: string | null = null;
+	private audioUrls: Map<string, string> = new Map();
 
 	constructor(leaf: WorkspaceLeaf, private plugin: ScuttlebuttPlugin) {
 		super(leaf);
@@ -738,15 +838,13 @@ class ScuttlebuttView extends ItemView {
 
 	async onClose(): Promise<void> {
 		this.stopTimer();
-		this.revokeAudioUrl();
+		this.revokeAudioUrls();
 		this.contentEl.empty();
 	}
 
-	private revokeAudioUrl(): void {
-		if (this.audioUrl) {
-			URL.revokeObjectURL(this.audioUrl);
-			this.audioUrl = null;
-		}
+	private revokeAudioUrls(): void {
+		for (const url of this.audioUrls.values()) URL.revokeObjectURL(url);
+		this.audioUrls.clear();
 	}
 
 	private get s(): MeetingSession {
@@ -776,7 +874,7 @@ class ScuttlebuttView extends ItemView {
 
 	render(): void {
 		this.stopTimer();
-		this.revokeAudioUrl();
+		this.revokeAudioUrls();
 		this.timerEl = null;
 		const root = this.contentEl;
 		root.empty();
@@ -786,7 +884,7 @@ class ScuttlebuttView extends ItemView {
 		this.renderCapture(root);
 
 		const s = this.s;
-		const hasContent = !!(s.audioData || s.transcript || s.summary);
+		const hasContent = !!(s.segments.length || s.transcript || s.summary);
 		if (hasContent || s.status !== 'idle') {
 			this.renderMeta(root);
 			this.renderContext(root);
@@ -854,20 +952,38 @@ class ScuttlebuttView extends ItemView {
 		const s = this.s;
 		const card = root.createDiv('mh-capture');
 		const recording = s.status === 'recording';
+		const busy = s.status === 'transcribing' || s.status === 'summarizing' || s.status === 'saving';
 
-		const recordBtn = card.createEl('button', { cls: ['mh-record-btn', recording ? 'is-recording' : ''] });
 		if (recording) {
-			const eq = recordBtn.createDiv('mh-eq');
-			for (let i = 0; i < 4; i++) eq.createSpan('mh-eq-bar');
-			this.timerEl = recordBtn.createSpan({ cls: 'mh-timer', text: formatDuration(s.elapsedMs) });
-			recordBtn.createSpan({ text: 'Stop', cls: 'mh-record-label' });
+			// The ribbon icon already turns red while recording — this stays a quiet
+			// status line, not a second big indicator.
+			const status = card.createDiv('mh-recording-status');
+			setIcon(status.createSpan('mh-recording-dot'), 'circle');
+			this.timerEl = status.createSpan({ cls: 'mh-timer', text: formatDuration(s.elapsedMs) });
+			status.createSpan({ text: 'Recording…', cls: 'mh-recording-label' });
+			const stopBtn = status.createEl('button', { cls: 'mh-mini-btn', text: 'Stop' });
+			stopBtn.onclick = () => this.plugin.toggleRecording();
+		} else if (s.segments.length > 0) {
+			// A meeting is already loaded/underway — offer to extend it, not restart it.
+			// While transcribing/summarizing, this cancels that job instead of waiting for it.
+			const addBtn = card.createEl('button', { cls: 'mh-record-btn' });
+			setIcon(addBtn.createSpan('mh-record-icon'), 'plus');
+			addBtn.createSpan({ text: 'Add recording', cls: 'mh-record-label' });
+			addBtn.disabled = s.status === 'saving';
+			addBtn.setAttr(
+				'title',
+				s.status === 'transcribing' || s.status === 'summarizing'
+					? 'Cancel this and record another take instead'
+					: 'Record another take into this same meeting — e.g. after a break.'
+			);
+			addBtn.onclick = () => this.plugin.addRecording();
 		} else {
+			const recordBtn = card.createEl('button', { cls: 'mh-record-btn' });
 			setIcon(recordBtn.createSpan('mh-record-icon'), 'mic');
 			recordBtn.createSpan({ text: 'Start recording', cls: 'mh-record-label' });
+			recordBtn.disabled = busy;
+			recordBtn.onclick = () => this.plugin.toggleRecording();
 		}
-		const busy = s.status === 'transcribing' || s.status === 'summarizing' || s.status === 'saving';
-		recordBtn.disabled = busy;
-		recordBtn.onclick = () => this.plugin.toggleRecording();
 
 		const importRow = card.createDiv('mh-import-row');
 		const vaultBtn = importRow.createEl('button', { cls: 'mh-ghost-btn' });
@@ -895,19 +1011,30 @@ class ScuttlebuttView extends ItemView {
 			s.diarize = diarCb.checked;
 		};
 
-		if (s.audioName && s.status !== 'recording') {
-			const clip = card.createDiv('mh-clip');
-			setIcon(clip.createSpan('mh-clip-icon'), 'audio-file');
-			clip.createSpan({ text: s.audioName, cls: 'mh-clip-name' });
-			if (s.status === 'recorded' || s.status === 'error') {
-				const proc = clip.createEl('button', { cls: 'mh-clip-action', text: 'Transcribe' });
-				proc.onclick = () => this.plugin.runPipeline();
-			}
+		if (s.segments.length > 0 && !recording) {
+			const list = card.createDiv('mh-segments');
+			for (const seg of s.segments) {
+				const row = list.createDiv('mh-segment');
+				const info = row.createDiv('mh-segment-info');
+				setIcon(info.createSpan('mh-clip-icon'), 'audio-file');
+				info.createSpan({ text: seg.audioName, cls: 'mh-clip-name' });
 
-			if (s.audioData) {
-				const player = card.createEl('audio', { cls: 'mh-audio', attr: { controls: 'true' } });
-				this.audioUrl = URL.createObjectURL(new Blob([s.audioData], { type: s.audioMime }));
-				player.src = this.audioUrl;
+				const del = row.createEl('button', { cls: 'mh-mini-btn mh-segment-delete' });
+				setIcon(del.createSpan(), 'trash-2');
+				del.setAttr('title', 'Delete this recording');
+				del.disabled = busy;
+				del.onclick = () => this.plugin.deleteSegment(seg.id);
+
+				const player = row.createEl('audio', { cls: 'mh-audio', attr: { controls: 'true' } });
+				if (seg.audioSourcePath) {
+					const file = this.app.vault.getAbstractFileByPath(seg.audioSourcePath);
+					if (file instanceof TFile) player.src = this.app.vault.getResourcePath(file);
+				} else if (seg.audioData) {
+					const url = URL.createObjectURL(new Blob([seg.audioData], { type: seg.audioMime }));
+					this.audioUrls.set(seg.id, url);
+					player.src = url;
+				}
+				fixMissingAudioDuration(player);
 			}
 		}
 	}
@@ -1100,8 +1227,8 @@ class ScuttlebuttView extends ItemView {
 		const retry = bar.createEl('button', { cls: 'mh-mini-btn' });
 		setIcon(retry.createSpan(), 'refresh-cw');
 		retry.createSpan({ text: 'Re-transcribe' });
-		retry.disabled = !s.audioData || s.status === 'transcribing' || s.status === 'summarizing';
-		retry.setAttr('title', s.audioData ? 'Transcribe the audio again' : 'No audio available to re-transcribe');
+		retry.disabled = !s.segments.length || s.status === 'transcribing' || s.status === 'summarizing';
+		retry.setAttr('title', s.segments.length ? 'Transcribe every recording again' : 'No audio available to re-transcribe');
 		retry.onclick = () => this.plugin.retranscribe();
 
 		const area = body.createEl('textarea', {
@@ -1219,6 +1346,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 	session: MeetingSession = newSession();
 	recorder = new MeetingRecorder();
 	ai!: AIService;
+	private ribbonIconEl: HTMLElement | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusBarTimer: number | null = null;
 	// In-flight transcription/summary request, so the user can cancel it. `cancelled`
@@ -1230,7 +1358,34 @@ export default class ScuttlebuttPlugin extends Plugin {
 		await this.loadSettings();
 
 		this.registerView(VIEW_TYPE_SCUTTLEBUTT, (leaf) => new ScuttlebuttView(leaf, this));
-		this.addRibbonIcon('mic', 'Scuttlebutt', () => this.activateView());
+		this.ribbonIconEl = this.addRibbonIcon('mic', 'Scuttlebutt', () => this.toggleRecording());
+
+		this.recorder.onUnexpectedEnd = (trackLabel) => {
+			new Notice(
+				`Mikrofonverbindung während der Aufnahme unterbrochen (${trackLabel}). ` +
+					'Der Rest dieser Aufnahme ist leer — bitte "Stop" drücken und danach "Add recording" erneut versuchen.',
+				12000
+			);
+			this.stopRecording();
+		};
+
+		// Same duration-metadata fix as the sidebar's own players, applied to the audio
+		// embeds Obsidian renders inside the note itself.
+		// Reading View and Live Preview render `![[...]]` audio embeds through entirely
+		// different internal paths — a markdown post-processor only covers Reading View.
+		// A single long-lived observer on the whole workspace catches <audio> elements
+		// regardless of which view (or future view) put them there.
+		const audioObserver = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				for (const node of mutation.addedNodes) {
+					if (!(node instanceof HTMLElement)) continue;
+					if (node.tagName === 'AUDIO') fixMissingAudioDuration(node as HTMLAudioElement);
+					node.querySelectorAll?.('audio').forEach((el) => fixMissingAudioDuration(el as HTMLAudioElement));
+				}
+			}
+		});
+		audioObserver.observe(document.body, { childList: true, subtree: true });
+		this.register(() => audioObserver.disconnect());
 
 		this.addCommand({ id: 'open-sidebar', name: 'Open sidebar', callback: () => this.activateView() });
 		this.addCommand({
@@ -1242,8 +1397,8 @@ export default class ScuttlebuttPlugin extends Plugin {
 			id: 'process-recording',
 			name: 'Transcribe & summarize current recording',
 			checkCallback: (checking) => {
-				const can = !!this.session.audioData && this.session.status !== 'transcribing';
-				if (can && !checking) this.runPipeline();
+				const can = this.session.segments.length > 0 && this.session.status !== 'transcribing';
+				if (can && !checking) this.retranscribe();
 				return can;
 			},
 		});
@@ -1258,6 +1413,22 @@ export default class ScuttlebuttPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new ScuttlebuttSettingTab(this.app, this));
+
+		// Auto-load an existing Scuttlebutt note when it's opened, so the sidebar acts
+		// as a properties panel for whichever such note is active — no separate command.
+		this.registerEvent(
+			this.app.workspace.on('file-open', (file) => {
+				if (this.recorder.isRecording() || !file) return;
+				if (file.path === this.session.savedNotePath || file.path === this.session.liveNotePath) return;
+				if (this.isScuttlebuttNote(file)) {
+					this.loadNoteIntoSession(file);
+				} else if (this.session.savedNotePath) {
+					// Navigated away from a finished (already-saved) meeting to an unrelated
+					// note — clear the stale session instead of leaving old data on display.
+					this.resetSession();
+				}
+			})
+		);
 
 		this.statusBarEl = this.addStatusBarItem();
 		this.statusBarEl.addClass('mh-statusbar');
@@ -1313,6 +1484,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	private setStatus(status: SessionStatus): void {
 		this.session.status = status;
+		this.ribbonIconEl?.toggleClass('scuttlebutt-ribbon-recording', status === 'recording');
 	}
 
 	private setProgress(label: string, pct: number): void {
@@ -1330,36 +1502,100 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	async startRecording(): Promise<void> {
-		if (this.session.status !== 'idle' && this.session.status !== 'error') {
-			// Fresh recording starts a fresh session unless there is unsaved review content.
-			if (this.session.summary || this.session.transcript) {
-				new Notice('Finish or clear the current meeting first ("New").');
-				await this.activateView();
-				return;
-			}
-		}
-		let result: { systemAudio: boolean };
+	/** Create an empty note and open it in the main pane for the user's own live minutes. */
+	private async createLiveNote(): Promise<void> {
 		try {
-			result = await this.recorder.start({
+			await this.ensureFolder(this.settings.notesFolder);
+			const base = `Recording ${recordingStamp(new Date(this.session.startedAt ?? Date.now()))}`;
+			const path = await this.uniquePath(this.settings.notesFolder, base, 'md');
+			const file = await this.app.vault.create(path, '');
+			this.session.liveNotePath = file.path;
+			await this.app.workspace.getLeaf(false).openFile(file);
+		} catch (err: any) {
+			// Recording still runs fine without a live note; just tell the user why typing has nowhere to go.
+			new Notice('Could not create the live note: ' + (err?.message ?? err));
+		}
+	}
+
+	/** Current on-disk content of the live note, or '' if there isn't one. */
+	private async readLiveNoteContent(): Promise<string> {
+		if (!this.session.liveNotePath) return '';
+		const file = this.app.vault.getAbstractFileByPath(this.session.liveNotePath);
+		return file instanceof TFile ? await this.app.vault.read(file) : '';
+	}
+
+	/** Request mic (+ optional system audio) capture. Shows its own Notices on failure/partial success. */
+	private async requestCapture(): Promise<{ ok: boolean; systemAudio: boolean }> {
+		try {
+			const result = await this.recorder.start({
 				inputDeviceId: this.settings.inputDeviceId,
 				systemAudioDeviceId: this.settings.systemAudioDeviceId,
 				captureSystemAudio: this.settings.captureSystemAudio,
 			});
+			if ((this.settings.systemAudioDeviceId || this.settings.captureSystemAudio) && !result.systemAudio) {
+				new Notice(
+					'System audio could not be captured — recording microphone only. ' +
+						'On macOS, install a loopback device (e.g. BlackHole) and pick it as the ' +
+						'System audio device in Settings → Capture.',
+					8000
+				);
+			}
+			return { ok: true, systemAudio: result.systemAudio };
 		} catch (err: any) {
+			// A start was already in flight (e.g. a double-click) — nothing went wrong,
+			// just quietly ignore the redundant second call instead of alarming the user.
+			if (err?.message === MeetingRecorder.ALREADY_STARTING) {
+				return { ok: false, systemAudio: false };
+			}
 			new Notice('Microphone access failed: ' + (err?.message ?? err));
-			return;
+			return { ok: false, systemAudio: false };
 		}
-		if ((this.settings.systemAudioDeviceId || this.settings.captureSystemAudio) && !result.systemAudio) {
-			new Notice(
-				'System audio could not be captured — recording microphone only. ' +
-					'On macOS, install a loopback device (e.g. BlackHole) and pick it as the ' +
-					'System audio device in Settings → Capture.',
-				8000
-			);
+	}
+
+	async startRecording(): Promise<void> {
+		// A saved session is finished business — clear it automatically so every
+		// entry point (ribbon icon, sidebar button, command palette) is always
+		// ready to go, instead of blocking on the "unsaved work" guard below.
+		if (this.session.savedNotePath) {
+			this.resetSession();
 		}
+		if (this.session.status !== 'idle' && this.session.status !== 'error') {
+			// Fresh recording starts a fresh session unless there is unsaved review content.
+			if (this.session.summary || this.session.transcript) {
+				new Notice('Finish or clear the current meeting first ("New"), or use "Add recording" to extend it.');
+				await this.activateView();
+				return;
+			}
+		}
+		const cap = await this.requestCapture();
+		if (!cap.ok) return;
 		this.session = newSession(this.settings.sttDiarize);
 		this.session.startedAt = Date.now();
+		this.setStatus('recording');
+		this.startStatusBarTimer();
+		await this.activateView();
+		this.refreshViews();
+		await this.createLiveNote();
+	}
+
+	/** Record another take into the current meeting (e.g. after a break) without discarding what's there. */
+	async addRecording(): Promise<void> {
+		if (this.recorder.isRecording()) return;
+		// Accidentally hit "Stop"? Don't force a wait for the transcript/summary of that
+		// clip to finish — cancel it and go straight into the next recording instead.
+		// But whatever's already done (e.g. the transcript, even if the *summary* didn't
+		// finish) must be saved first — deterministically, before touching the mic again,
+		// not left to race against finishCancelled()'s own async cleanup.
+		if (this.session.status === 'transcribing' || this.session.status === 'summarizing') {
+			this.cancelActive();
+			if (this.session.transcript.trim() || this.session.summary.trim()) {
+				await this.syncNote();
+			}
+		}
+		const cap = await this.requestCapture();
+		if (!cap.ok) return;
+		this.session.startedAt = Date.now();
+		console.debug('[Scuttlebutt] addRecording(): session.startedAt set to', this.session.startedAt);
 		this.setStatus('recording');
 		this.startStatusBarTimer();
 		await this.activateView();
@@ -1368,23 +1604,80 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	async stopRecording(): Promise<void> {
 		if (!this.recorder.isRecording()) return;
+		// MediaRecorder only delivers its first chunk after ~1s; stopping before that
+		// always yields an empty clip. Rather than let that read as a mysterious bug,
+		// just wait out the remainder before actually stopping.
+		const elapsedSoFar = this.session.startedAt ? Date.now() - this.session.startedAt : 0;
+		console.debug('[Scuttlebutt] main.stopRecording(): session.startedAt =', this.session.startedAt, 'elapsedSoFar =', elapsedSoFar, 'ms');
+		const MIN_RECORDING_MS = 1200;
+		if (elapsedSoFar < MIN_RECORDING_MS) {
+			await new Promise((r) => window.setTimeout(r, MIN_RECORDING_MS - elapsedSoFar));
+		}
 		this.session.elapsedMs = this.session.startedAt ? Date.now() - this.session.startedAt : 0;
 		const blob = await this.recorder.stop();
 		this.stopStatusBarTimer();
 		if (blob.size === 0) {
 			new Notice('Recording was empty.');
+			this.setStatus(this.session.segments.length > 0 ? (this.session.summary ? 'ready' : 'recorded') : 'idle');
+			this.refreshViews();
+			return;
+		}
+		const startedAt = this.session.startedAt ?? Date.now();
+		const segment: AudioSegment = {
+			id: `${recordingStamp(new Date(startedAt))}-${Math.random().toString(36).slice(2, 6)}`,
+			audioData: await blob.arrayBuffer(),
+			audioMime: this.recorder.getMimeType(),
+			audioName: `Recording ${recordingStamp(new Date(startedAt))}.webm`,
+			audioSourcePath: null,
+			transcript: '',
+		};
+		this.session.segments.push(segment);
+		this.setStatus('recorded');
+		this.refreshViews();
+		// Persist the raw audio to the note right away, before transcription/summary even
+		// start — so a crash, cancellation, or Obsidian restart during processing can never
+		// lose the recording itself, only (at worst) having to redo transcription.
+		await this.syncNote();
+		new Notice('Recording saved. Transcribing…');
+		this.runPipeline(segment);
+	}
+
+	/** Delete one recording (and its transcript) from the current meeting. */
+	async deleteSegment(id: string): Promise<void> {
+		const s = this.session;
+		const idx = s.segments.findIndex((seg) => seg.id === id);
+		if (idx === -1) return;
+		const [removed] = s.segments.splice(idx, 1);
+		if (removed.audioSourcePath) {
+			const file = this.app.vault.getAbstractFileByPath(removed.audioSourcePath);
+			if (file instanceof TFile) {
+				try {
+					await this.app.vault.trash(file, true);
+				} catch (err) {
+					console.warn('Scuttlebutt: could not delete audio file', err);
+				}
+			}
+		}
+		this.recomputeTranscript();
+		this.refreshViews();
+		if (s.segments.length === 0) {
 			this.setStatus('idle');
 			this.refreshViews();
 			return;
 		}
-		this.session.audioData = await blob.arrayBuffer();
-		this.session.audioMime = this.recorder.getMimeType();
-		this.session.audioName = `recording ${todayStamp(new Date())} ${formatDuration(this.session.elapsedMs)}.webm`;
-		this.session.audioSourcePath = null;
-		this.setStatus('recorded');
-		this.refreshViews();
-		new Notice('Recording saved. Transcribing…');
-		this.runPipeline();
+		if (this.settings.autoSummarize && this.settings.llmEndpoint && this.settings.llmModel && s.transcript.trim()) {
+			await this.summarizeInternal();
+		} else {
+			await this.syncNote();
+		}
+	}
+
+	/** Recompute the combined transcript from every segment's own text. */
+	private recomputeTranscript(): void {
+		this.session.transcript = this.session.segments
+			.map((seg) => seg.transcript.trim())
+			.filter(Boolean)
+			.join('\n\n---\n\n');
 	}
 
 	// ---- import ----------------------------------------------------------
@@ -1393,13 +1686,18 @@ export default class ScuttlebuttPlugin extends Plugin {
 		try {
 			const data = await this.app.vault.readBinary(file);
 			this.session = newSession(this.settings.sttDiarize);
-			this.session.audioData = data;
-			this.session.audioMime = this.mimeForExtension(file.extension);
-			this.session.audioName = file.name;
-			this.session.audioSourcePath = file.path;
+			const segment: AudioSegment = {
+				id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
+				audioData: data,
+				audioMime: this.mimeForExtension(file.extension),
+				audioName: file.name,
+				audioSourcePath: file.path,
+				transcript: '',
+			};
+			this.session.segments.push(segment);
 			this.setStatus('recorded');
 			this.refreshViews();
-			this.runPipeline();
+			this.runPipeline(segment);
 		} catch (err: any) {
 			new Notice('Could not read audio file: ' + (err?.message ?? err));
 		}
@@ -1409,14 +1707,19 @@ export default class ScuttlebuttPlugin extends Plugin {
 		try {
 			const data = await file.arrayBuffer();
 			this.session = newSession(this.settings.sttDiarize);
-			this.session.audioData = data;
-			this.session.audioMime = file.type || this.mimeForExtension(file.name.split('.').pop() ?? '');
-			this.session.audioName = file.name;
-			this.session.audioSourcePath = null;
+			const segment: AudioSegment = {
+				id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
+				audioData: data,
+				audioMime: file.type || this.mimeForExtension(file.name.split('.').pop() ?? ''),
+				audioName: file.name,
+				audioSourcePath: null,
+				transcript: '',
+			};
+			this.session.segments.push(segment);
 			this.setStatus('recorded');
 			await this.activateView();
 			this.refreshViews();
-			this.runPipeline();
+			this.runPipeline(segment);
 		} catch (err: any) {
 			new Notice('Could not read audio file: ' + (err?.message ?? err));
 		}
@@ -1440,8 +1743,8 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	// ---- pipeline --------------------------------------------------------
 
-	async runPipeline(): Promise<void> {
-		const ok = await this.transcribeStep();
+	async runPipeline(segment: AudioSegment): Promise<void> {
+		const ok = await this.transcribeStep(segment);
 		if (!ok) return;
 
 		// Summarize (+ title + tags), if enabled and configured.
@@ -1453,29 +1756,47 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.setProgress('Transcript ready. Review, then summarize when ready.', 100);
 			s.activeTab = 'transcript';
 			this.refreshViews();
+			await this.syncNote();
 			window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 		}
 	}
 
-	/** Re-run transcription on the current audio, leaving any existing summary in place. */
+	/** Re-run transcription on every recording, leaving any existing summary in place. */
 	async retranscribe(): Promise<void> {
-		if (!this.session.audioData) {
+		if (this.session.segments.length === 0) {
 			new Notice('No audio to transcribe.');
 			return;
 		}
-		const ok = await this.transcribeStep();
-		if (!ok) return;
+		for (const segment of this.session.segments) {
+			const ok = await this.transcribeStep(segment);
+			if (!ok) return;
+		}
 		this.setStatus(this.session.summary ? 'ready' : 'recorded');
 		this.setProgress('Transcript updated.', 100);
 		this.session.activeTab = 'transcript';
 		this.refreshViews();
+		await this.syncNote();
 		window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 	}
 
-	/** Transcribe the current audio into the session. Returns false (and sets error state) on failure. */
-	private async transcribeStep(): Promise<boolean> {
+	/** Load a segment's audio from the vault if we only have a path for it (e.g. a note loaded from disk). */
+	private async ensureSegmentAudioData(segment: AudioSegment): Promise<boolean> {
+		if (segment.audioData) return true;
+		if (!segment.audioSourcePath) return false;
+		const file = this.app.vault.getAbstractFileByPath(segment.audioSourcePath);
+		if (!(file instanceof TFile)) return false;
+		try {
+			segment.audioData = await this.app.vault.readBinary(file);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Transcribe one segment's audio. Returns false (and sets error state) on failure. */
+	private async transcribeStep(segment: AudioSegment): Promise<boolean> {
 		const s = this.session;
-		if (!s.audioData) {
+		if (!(await this.ensureSegmentAudioData(segment))) {
 			new Notice('No audio to transcribe.');
 			return false;
 		}
@@ -1483,7 +1804,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 		this.setStatus('transcribing');
 		this.setProgress('Transcribing audio…', 30);
 		this.refreshViews();
-		const name = s.audioName || 'recording.webm';
+		const name = segment.audioName || 'recording.webm';
 		const wantSpeakers = s.diarize;
 		this.cancelled = false;
 		const controller = new AbortController();
@@ -1492,7 +1813,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 		let fellBack = false;
 		try {
 			try {
-				result = await this.ai.transcribe(s.audioData, name, s.audioMime, wantSpeakers, controller.signal);
+				result = await this.ai.transcribe(segment.audioData!, name, segment.audioMime, wantSpeakers, controller.signal);
 			} catch (diarErr) {
 				// A cancel or a non-diarized failure is terminal; only a diarized attempt
 				// is worth retrying flat.
@@ -1501,7 +1822,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 				new Notice('Speaker identification failed — transcribing without speaker labels.');
 				this.setProgress('Retrying without speaker identification…', 30);
 				this.refreshViews();
-				result = await this.ai.transcribe(s.audioData, name, s.audioMime, false, controller.signal);
+				result = await this.ai.transcribe(segment.audioData!, name, segment.audioMime, false, controller.signal);
 			}
 		} catch (err: any) {
 			if (this.cancelled) {
@@ -1517,7 +1838,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 		} finally {
 			this.activeController = null;
 		}
-		s.transcript = result.text;
+		segment.transcript = result.text;
 		// Diarization was requested and the request *succeeded*, but the endpoint gave
 		// back no speaker labels — it silently ignored the request. Say so, so a flat
 		// transcript doesn't look like the feature is broken. (Skip if we already fell
@@ -1525,13 +1846,14 @@ export default class ScuttlebuttPlugin extends Plugin {
 		if (wantSpeakers && !fellBack && !result.hasSpeakers) {
 			new Notice('This endpoint returned no speaker labels — saved as a flat transcript. It may not support speaker identification.');
 		}
-		if (!s.transcript.trim()) {
+		if (!segment.transcript.trim()) {
 			s.error = 'Transcription returned no text. The clip may be silent or in an unsupported format.';
 			this.setStatus('error');
 			this.setProgress('', 0);
 			this.refreshViews();
 			return false;
 		}
+		this.recomputeTranscript();
 		return true;
 	}
 
@@ -1616,6 +1938,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.setStatus('ready');
 			this.setProgress('Summary ready. Review and save.', 100);
 			this.refreshViews();
+			await this.syncNote();
 			window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 		} finally {
 			this.activeController = null;
@@ -1642,10 +1965,23 @@ export default class ScuttlebuttPlugin extends Plugin {
 	private finishCancelled(): void {
 		const s = this.session;
 		s.error = null;
-		this.setStatus(s.summary ? 'ready' : s.audioData ? 'recorded' : 'idle');
+		// If "Add recording" already started a new take in the meantime, leave that
+		// status alone instead of clobbering it with the now-stale cancelled state.
+		const startingFresh = this.recorder.isRecording();
+		if (!startingFresh) {
+			this.setStatus(s.summary ? 'ready' : s.segments.length > 0 ? 'recorded' : 'idle');
+		}
 		this.setProgress('', 0);
 		this.refreshViews();
 		new Notice('Cancelled.');
+		// Whatever transcript/audio already exists (e.g. the segment finished
+		// transcribing before the *summary* got cancelled) must not be lost just
+		// because this particular pipeline run didn't reach its own save step —
+		// persist it now. Skip this while a new take is already recording, so we
+		// don't race that in-progress capture.
+		if (!startingFresh && (s.transcript.trim() || s.summary.trim())) {
+			this.syncNote();
+		}
 	}
 
 	private async readContextDocs(): Promise<{ path: string; content: string }[]> {
@@ -1679,33 +2015,44 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	// ---- saving ----------------------------------------------------------
 
-	async saveNote(): Promise<void> {
+	/**
+	 * Write transcript/summary/etc. into the bound note. Called automatically right
+	 * after transcription and summarization complete, so there's no separate "save"
+	 * step in the normal flow; also callable manually (via the Save button) to persist
+	 * hand-edits made afterwards (title, tags, or the summary/transcript text areas).
+	 */
+	async syncNote(options: { notify?: boolean } = {}): Promise<void> {
 		const s = this.session;
-		if (!s.summary && !s.transcript) {
-			new Notice('Nothing to save yet.');
-			return;
+		if (!s.summary && !s.transcript && s.segments.length === 0) return;
+
+		const wasBusy = s.status === 'transcribing' || s.status === 'summarizing';
+		if (!wasBusy) {
+			this.setStatus('saving');
+			this.setProgress('Saving note…', 90);
+			this.refreshViews();
 		}
-		this.setStatus('saving');
-		this.setProgress('Saving note…', 90);
-		this.refreshViews();
 
 		try {
-			let audioLink: string | null = s.audioSourcePath;
-			if (this.settings.saveAudio && s.audioData && !s.audioSourcePath) {
-				audioLink = await this.saveAudioFile();
+			if (this.settings.saveAudio) {
+				for (const seg of s.segments) {
+					if (seg.audioData && !seg.audioSourcePath) {
+						seg.audioSourcePath = await this.saveSegmentAudio(seg);
+					}
+				}
 			}
 
-			const notePath = await this.writeNote(audioLink);
+			const notePath = await this.writeNote();
 			s.savedNotePath = notePath;
-			this.setStatus('ready');
-			this.setProgress('Saved ✓', 100);
-			this.refreshViews();
-			new Notice('Meeting note saved: ' + notePath);
-
-			if (this.settings.autoOpenNote) {
-				this.app.workspace.openLinkText(notePath, '', true);
+			if (!wasBusy) {
+				this.setStatus('ready');
+				this.setProgress('Saved ✓', 100);
 			}
-			window.setTimeout(() => this.clearProgressIfIdle(), 4000);
+			this.refreshViews();
+			if (options.notify) {
+				new Notice('Meeting note saved: ' + notePath);
+				if (this.settings.autoOpenNote) this.app.workspace.openLinkText(notePath, '', true);
+			}
+			if (!wasBusy) window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 		} catch (err: any) {
 			s.error = 'Could not save note: ' + (err?.message ?? err);
 			this.setStatus('error');
@@ -1715,26 +2062,33 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	private async saveAudioFile(): Promise<string> {
-		const s = this.session;
+	/** Manual "Save" button: same write as the automatic sync, but always confirms. */
+	async saveNote(): Promise<void> {
+		if (!this.session.summary && !this.session.transcript) {
+			new Notice('Nothing to save yet.');
+			return;
+		}
+		await this.syncNote({ notify: true });
+	}
+
+	private async saveSegmentAudio(segment: AudioSegment): Promise<string> {
 		await this.ensureFolder(this.settings.audioFolder);
-		const ext = (s.audioName.split('.').pop() || 'webm').toLowerCase();
-		const base = sanitizeFileName(`${todayStamp(new Date())} ${s.title || 'recording'}`);
+		const ext = (segment.audioName.split('.').pop() || 'webm').toLowerCase();
+		const base = sanitizeFileName(segment.audioName.replace(/\.[^./]+$/, ''));
 		const path = await this.uniquePath(this.settings.audioFolder, base, ext);
-		await this.app.vault.createBinary(path, s.audioData!);
+		await this.app.vault.createBinary(path, segment.audioData!);
 		return path;
 	}
 
-	private async writeNote(audioLink: string | null): Promise<string> {
+	private async writeNote(): Promise<string> {
 		const s = this.session;
 		await this.ensureFolder(this.settings.notesFolder);
 
 		const now = new Date();
 		const title = s.title.trim() || 'Meeting';
-		const base = sanitizeFileName(`${todayStamp(now)} — ${title}`);
-		const path = await this.uniquePath(this.settings.notesFolder, base, 'md');
 
 		const fm: string[] = ['---'];
+		fm.push('scuttlebutt: true');
 		fm.push(`date created: ${yamlString(moment(now).format(this.settings.dateFormat || DEFAULT_DATE_FORMAT))}`);
 		if (s.tags.length > 0) fm.push(`tags: [${s.tags.map(yamlString).join(', ')}]`);
 		if (s.participants.length > 0) {
@@ -1744,18 +2098,52 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 		const parts: string[] = [fm.join('\n')];
 
-		if (audioLink) parts.push(`![[${audioLink}]]`, '');
+		const audioLinks = s.segments.map((seg) => seg.audioSourcePath).filter((p): p is string => !!p);
+		for (const link of audioLinks) parts.push(`![[${link}]]`);
+		if (audioLinks.length > 0) parts.push('');
 
 		parts.push(s.summary.trim() || '*No summary generated.*');
 
-		if (this.settings.includeMemo && s.memo.trim()) {
-			parts.push('', calloutBlock('quote', 'Memo', s.memo.trim(), true));
+		// Live-typed notes from the quick-start note take precedence over the sidebar
+		// Memo field — they're the same idea, but typed in a real editor.
+		const liveNoteContent = await this.readLiveNoteContent();
+		const memoContent = liveNoteContent.trim() || s.memo.trim();
+		if (this.settings.includeMemo && memoContent) {
+			parts.push('', calloutBlock('quote', 'Memo', memoContent, true));
 		}
 		if (this.settings.includeTranscript && s.transcript.trim()) {
 			parts.push('', calloutBlock('note', 'Transcript', s.transcript.trim(), true));
 		}
 
-		const file = await this.app.vault.create(path, parts.join('\n') + '\n');
+		const content = parts.join('\n') + '\n';
+		const base = sanitizeFileName(`${todayStamp(now)} — ${title}`);
+
+		// If quick-start already created a live note, rename & fill that same file
+		// instead of creating a second one — keeps everything as one tidy note.
+		if (s.liveNotePath) {
+			const existing = this.app.vault.getAbstractFileByPath(s.liveNotePath);
+			if (existing instanceof TFile) {
+				const newPath = await this.uniquePath(this.settings.notesFolder, base, 'md', existing.path);
+				if (newPath !== existing.path) {
+					await this.app.fileManager.renameFile(existing, newPath);
+				}
+				await this.app.vault.modify(existing, content);
+				return existing.path;
+			}
+		}
+
+		// A note that was already loaded (opened from the vault, not created just now)
+		// keeps its existing name — only its content is refreshed in place.
+		if (s.savedNotePath) {
+			const existing = this.app.vault.getAbstractFileByPath(s.savedNotePath);
+			if (existing instanceof TFile) {
+				await this.app.vault.modify(existing, content);
+				return existing.path;
+			}
+		}
+
+		const path = await this.uniquePath(this.settings.notesFolder, base, 'md');
+		const file = await this.app.vault.create(path, content);
 		return file.path;
 	}
 
@@ -1765,6 +2153,65 @@ export default class ScuttlebuttPlugin extends Plugin {
 		if (this.recorder.isRecording()) this.recorder.abort();
 		this.stopStatusBarTimer();
 		this.session = newSession(this.settings.sttDiarize);
+		this.refreshViews();
+	}
+
+	// ---- loading an existing note ----------------------------------------
+
+	private isScuttlebuttNote(file: TFile): boolean {
+		return !!this.app.metadataCache.getFileCache(file)?.frontmatter?.scuttlebutt;
+	}
+
+	/**
+	 * Load a previously saved Scuttlebutt note's audio, transcript, summary, tags
+	 * and participants back into the session, so the sidebar acts like a
+	 * properties panel for whichever such note is currently open: edit tags,
+	 * re-transcribe, re-summarize, or add another recording to it.
+	 */
+	private async loadNoteIntoSession(file: TFile): Promise<void> {
+		const content = await this.app.vault.read(file);
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+		const fmEnd = content.indexOf('\n---', 3);
+		const body = fmEnd === -1 ? content : content.slice(fmEnd + 4).trim();
+
+		const s = newSession(this.settings.sttDiarize);
+		s.title = file.basename.replace(/^\d{4}-\d{2}-\d{2} — /, '');
+		s.tags = Array.isArray(fm.tags) ? fm.tags.map(String) : [];
+		s.participants = Array.isArray(fm.participants) ? fm.participants.map(String) : [];
+
+		for (const link of extractAudioEmbeds(body)) {
+			const target = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
+			s.segments.push({
+				id: target?.path ?? link,
+				audioData: null,
+				audioMime: target ? this.mimeForExtension(target.extension) : 'audio/webm',
+				audioName: target?.name ?? link,
+				audioSourcePath: target?.path ?? link,
+				transcript: '',
+			});
+		}
+
+		const transcript = extractCallout(body, 'note', 'Transcript') ?? '';
+		if (s.segments.length > 0) {
+			// The combined transcript is segments joined by "\n\n---\n\n" (see
+			// recomputeTranscript) — split back along that same separator so each
+			// segment keeps its own text where possible.
+			const chunks = transcript.split(/\n\n---\n\n/);
+			if (chunks.length === s.segments.length) {
+				s.segments.forEach((seg, i) => (seg.transcript = chunks[i]));
+			} else {
+				s.segments[s.segments.length - 1].transcript = transcript;
+			}
+		}
+		s.transcript = transcript;
+
+		const memo = extractCallout(body, 'quote', 'Memo');
+		if (memo) s.memo = memo;
+		s.summary = extractSummaryBody(body);
+
+		s.savedNotePath = file.path;
+		s.status = s.summary ? 'ready' : s.segments.length > 0 ? 'recorded' : 'idle';
+		this.session = s;
 		this.refreshViews();
 	}
 
@@ -1788,11 +2235,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	private async uniquePath(folder: string, base: string, ext: string): Promise<string> {
+	private async uniquePath(folder: string, base: string, ext: string, excludePath?: string): Promise<string> {
 		const dir = normalizePath(folder);
 		let candidate = normalizePath(`${dir}/${base}.${ext}`);
 		let i = 2;
-		while (this.app.vault.getAbstractFileByPath(candidate)) {
+		while (candidate !== excludePath && this.app.vault.getAbstractFileByPath(candidate)) {
 			candidate = normalizePath(`${dir}/${base} (${i}).${ext}`);
 			i++;
 		}

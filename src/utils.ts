@@ -33,6 +33,12 @@ export function todayStamp(d: Date): string {
 	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+/** Local timestamp as YYYYMMDDHHmmss — matches the core Audio recorder plugin's file naming. */
+export function recordingStamp(d: Date): string {
+	const pad = (n: number) => n.toString().padStart(2, '0');
+	return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
 /** Strip characters that are illegal in file names or that anarlog forbids in titles. */
 export function sanitizeTitle(raw: string): string {
 	return raw
@@ -163,6 +169,54 @@ export function calloutBlock(type: string, title: string, content: string, colla
 		.map((line) => (line.length ? `> ${line}` : '>'))
 		.join('\n');
 	return `${head}\n${body}`;
+}
+
+/** Every `![[...]]` audio embed target from a note body, in order of appearance. */
+export function extractAudioEmbeds(body: string): string[] {
+	const AUDIO_EXT = /\.(webm|m4a|mp3|mpga|wav|ogg|oga|flac|aac|mp4)$/i;
+	const re = /!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+	const out: string[] = [];
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(body))) {
+		if (AUDIO_EXT.test(m[1])) out.push(m[1]);
+	}
+	return out;
+}
+
+/**
+ * Pull the plain-text content back out of a `> [!type]- Title` callout block
+ * written by calloutBlock(). Returns null if that callout isn't present.
+ */
+export function extractCallout(body: string, type: string, title: string): string | null {
+	const lines = body.split('\n');
+	const headRe = new RegExp(`^>\\s*\\[!${type}\\]-?\\s*${title}\\s*$`, 'i');
+	const start = lines.findIndex((l) => headRe.test(l.trim()));
+	if (start === -1) return null;
+	const out: string[] = [];
+	for (let i = start + 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (line === '>') {
+			out.push('');
+			continue;
+		}
+		if (line.startsWith('> ')) {
+			out.push(line.slice(2));
+			continue;
+		}
+		break;
+	}
+	return out.join('\n').trim();
+}
+
+/**
+ * The summary portion of a note body: everything after any leading audio
+ * embeds, up to the first callout block (Memo/Transcript), trimmed.
+ */
+export function extractSummaryBody(body: string): string {
+	const idx = body.search(/^>\s*\[!/m);
+	let main = (idx === -1 ? body : body.slice(0, idx)).trim();
+	main = main.replace(/^(!\[\[[^\]]+\]\]\s*\n?)+/, '').trim();
+	return main;
 }
 
 /**

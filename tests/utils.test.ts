@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import {
 	buildMultipart,
 	calloutBlock,
+	extractAudioEmbeds,
+	extractCallout,
+	extractSummaryBody,
 	formatDiarizedSegments,
 	formatDuration,
 	joinUrl,
@@ -16,6 +19,7 @@ import {
 	stripCodeFences,
 	structureSummary,
 	todayStamp,
+	recordingStamp,
 	truncate,
 	yamlString,
 } from '../src/utils';
@@ -38,6 +42,11 @@ test('formatDuration renders m:ss and h:mm:ss', () => {
 	assert.equal(formatDuration(65_000), '1:05');
 	assert.equal(formatDuration(3_661_000), '1:01:01');
 	assert.equal(formatDuration(-1000), '0:00');
+});
+
+test('recordingStamp is zero-padded local YYYYMMDDHHmmss', () => {
+	assert.equal(recordingStamp(new Date(2026, 0, 5, 9, 3, 7)), '20260105090307');
+	assert.equal(recordingStamp(new Date(2026, 11, 31, 23, 59, 59)), '20261231235959');
 });
 
 test('todayStamp is zero-padded local YYYY-MM-DD', () => {
@@ -173,4 +182,26 @@ test('buildMultipart produces a well-formed body and boundary', () => {
 	assert.ok(decoded.includes('name="file"; filename="a.webm"'));
 	assert.ok(decoded.includes('Content-Type: audio/webm'));
 	assert.ok(decoded.includes(`--${boundary}--`));
+});
+
+test('extractAudioEmbeds finds only audio embeds, in order', () => {
+	const body = '![[Recording 1.webm]]\n![[Recording 2.m4a]]\n![[chart.png]]\n[[Recording 1.webm]]';
+	assert.deepEqual(extractAudioEmbeds(body), ['Recording 1.webm', 'Recording 2.m4a']);
+});
+
+test('extractCallout round-trips what calloutBlock wrote, including blank lines', () => {
+	const original = 'Line one.\n\nLine two.';
+	const block = calloutBlock('note', 'Transcript', original, true);
+	const body = `# Title\n\nSome summary.\n\n${block}\n`;
+	assert.equal(extractCallout(body, 'note', 'Transcript'), original);
+});
+
+test('extractCallout returns null when the callout is absent', () => {
+	assert.equal(extractCallout('# Title\n\nJust a summary, no callouts.', 'quote', 'Memo'), null);
+});
+
+test('extractSummaryBody strips leading audio embeds and stops before the first callout', () => {
+	const body =
+		'![[Recording 1.webm]]\n![[Recording 2.webm]]\n\n# Title\n\nOverview text.\n\n> [!note]- Transcript\n> hi';
+	assert.equal(extractSummaryBody(body), '# Title\n\nOverview text.');
 });
