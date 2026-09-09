@@ -42,7 +42,7 @@ export function recordingStamp(d: Date): string {
 /** Strip characters that are illegal in file names or that anarlog forbids in titles. */
 export function sanitizeTitle(raw: string): string {
 	return raw
-		.replace(/[\*"'`\(\)\[\]\{\}:;\\/<>|?]/g, '')
+		.replace(/[\*"'`\(\)\[\]\{\}:;\\/<>|?]/g, ' ')
 		.replace(/\s+/g, ' ')
 		.trim();
 }

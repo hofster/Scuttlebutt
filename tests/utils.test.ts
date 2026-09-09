@@ -57,7 +57,7 @@ test('todayStamp is zero-padded local YYYY-MM-DD', () => {
 test('sanitizeTitle strips forbidden punctuation and collapses whitespace', () => {
 	assert.equal(sanitizeTitle('Q3 Roadmap: Sync (v2)'), 'Q3 Roadmap Sync v2');
 	assert.equal(sanitizeTitle('  "Kickoff"  call  '), 'Kickoff call');
-	assert.equal(sanitizeTitle('a/b\\c'), 'abc');
+	assert.equal(sanitizeTitle('a/b\\c'), 'a b c');
 });
 
 test('sanitizeFileName removes reserved chars and falls back to Meeting', () => {

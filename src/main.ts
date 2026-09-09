@@ -641,7 +641,14 @@ class AIService {
 		const user = `<note>\n${content}\n</note>\n\nNow, give me a SUPER CONCISE title for the above note. Only about the topic of the meeting.`;
 		const out = (await this.chat(system, user, 64, 0.3, signal)).trim();
 		if (!out || out === '<EMPTY>') return '';
-		return sanitizeTitle(out);
+		const title = sanitizeTitle(out);
+		// Defensive: some models occasionally regurgitate memorized code-corpus metadata
+		// (e.g. "<reponame>...<file_sep>...") instead of a real title for this exact task.
+		// A genuine title is short prose — reject anything that looks like that instead.
+		if (title.length > 100 || /repo_?name|file_sep|gh_stars|<filename>/i.test(out)) {
+			return '';
+		}
+		return title;
 	}
 
 	async generateTags(
@@ -733,6 +740,7 @@ interface MeetingSession {
 	progressPct: number;
 	savedNotePath: string | null;
 	liveNotePath: string | null; // note created at quick-start time; merged into the final note on save
+	foreignNote: boolean; // true when bound to a note we didn't create — only ever merge into a marked block, never replace its content
 }
 
 function newSession(diarizeDefault = false): MeetingSession {
@@ -756,6 +764,7 @@ function newSession(diarizeDefault = false): MeetingSession {
 		progressPct: 0,
 		savedNotePath: null,
 		liveNotePath: null,
+		foreignNote: false,
 	};
 }
 
@@ -997,6 +1006,25 @@ class ScuttlebuttView extends ItemView {
 		diskBtn.createSpan({ text: 'Upload' });
 		diskBtn.disabled = recording || busy;
 		diskBtn.onclick = () => this.uploadAudioFromDisk();
+
+		// A dedicated way to "Scuttlebutt-ify" a note that already has one or more audio
+		// embeds but wasn't created by this plugin — picks up every embed automatically,
+		// no need to select each file individually via "From vault". Only shown when the
+		// active note actually has embedded audio, per the file-open-maintained cache.
+		console.debug('[Scuttlebutt] renderCapture: segments=', s.segments.length, 'recording=', recording, 'activeNoteAudioFiles=', this.plugin.activeNoteAudioFiles.length);
+		if (s.segments.length === 0 && !recording && this.plugin.activeNoteAudioFiles.length > 0) {
+			const noteRow = card.createDiv('mh-import-row');
+			const noteBtn = noteRow.createEl('button', { cls: 'mh-ghost-btn' });
+			setIcon(noteBtn.createSpan('mh-ghost-icon'), 'file-audio-2');
+			const count = this.plugin.activeNoteAudioFiles.length;
+			noteBtn.createSpan({ text: count > 1 ? `This note's audio (${count})` : "This note's audio" });
+			noteBtn.disabled = busy;
+			noteBtn.setAttr(
+				'title',
+				'Transcribe & summarize every audio embed already in this note, writing the result back into it.'
+			);
+			noteBtn.onclick = () => this.plugin.scuttlebuttifyActiveNote();
+		}
 
 		// Per-recording speaker identification, seeded from the global default. Flipping
 		// this after a transcript exists takes effect on the next (Re-)transcribe.
@@ -1347,6 +1375,10 @@ export default class ScuttlebuttPlugin extends Plugin {
 	recorder = new MeetingRecorder();
 	ai!: AIService;
 	private ribbonIconEl: HTMLElement | null = null;
+	// Audio files embedded in the current non-Scuttlebutt active note, if any — kept in
+	// sync via the file-open handler below, so renderCapture() can show the "This note's
+	// audio" button without doing an async file read on every render.
+	activeNoteAudioFiles: TFile[] = [];
 	private statusBarEl: HTMLElement | null = null;
 	private statusBarTimer: number | null = null;
 	// In-flight transcription/summary request, so the user can cancel it. `cancelled`
@@ -1414,18 +1446,43 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 		this.addSettingTab(new ScuttlebuttSettingTab(this.app, this));
 
+		// file-open only fires on navigation — if a note was already active before the
+		// plugin (re)loaded, it never fires for that note at all. Check once explicitly,
+		// after the workspace has finished restoring, so "This note's audio" and the
+		// auto-load-on-open behavior both work immediately without requiring a manual
+		// switch away and back.
+		this.app.workspace.onLayoutReady(async () => {
+			const initialFile = this.app.workspace.getActiveFile();
+			console.debug('[Scuttlebutt] onLayoutReady, initialFile =', initialFile?.path);
+			if (!initialFile) return;
+			if (this.isScuttlebuttNote(initialFile)) {
+				await this.loadNoteIntoSession(initialFile);
+			} else {
+				this.activeNoteAudioFiles = await this.findEmbeddedAudioFiles(initialFile);
+				console.debug('[Scuttlebutt] onLayoutReady found audio embeds:', this.activeNoteAudioFiles.map((f) => f.path));
+				this.refreshViews();
+			}
+		});
+
 		// Auto-load an existing Scuttlebutt note when it's opened, so the sidebar acts
 		// as a properties panel for whichever such note is active — no separate command.
 		this.registerEvent(
-			this.app.workspace.on('file-open', (file) => {
+			this.app.workspace.on('file-open', async (file) => {
+				console.debug('[Scuttlebutt] file-open:', file?.path, 'isScuttlebuttNote =', file ? this.isScuttlebuttNote(file) : null);
 				if (this.recorder.isRecording() || !file) return;
 				if (file.path === this.session.savedNotePath || file.path === this.session.liveNotePath) return;
 				if (this.isScuttlebuttNote(file)) {
 					this.loadNoteIntoSession(file);
-				} else if (this.session.savedNotePath) {
-					// Navigated away from a finished (already-saved) meeting to an unrelated
-					// note — clear the stale session instead of leaving old data on display.
-					this.resetSession();
+					this.activeNoteAudioFiles = [];
+				} else {
+					if (this.session.savedNotePath) {
+						// Navigated away from a finished (already-saved) meeting to an unrelated
+						// note — clear the stale session instead of leaving old data on display.
+						this.resetSession();
+					}
+					this.activeNoteAudioFiles = await this.findEmbeddedAudioFiles(file);
+					console.debug('[Scuttlebutt] file-open found audio embeds:', this.activeNoteAudioFiles.map((f) => f.path));
+					this.refreshViews();
 				}
 			})
 		);
@@ -1684,8 +1741,17 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	async importFromVault(file: TFile): Promise<void> {
 		try {
+			// If the currently open note already embeds this exact audio file, treat that
+			// as "Scuttlebutt-ify this note" — write the result into it in place, instead
+			// of creating a new note with today's date. A note that doesn't reference this
+			// audio at all gets the normal fresh-note behavior, so this can't silently
+			// overwrite an unrelated open note.
+			const boundNotePath = await this.findNoteEmbedding(file);
+
 			const data = await this.app.vault.readBinary(file);
 			this.session = newSession(this.settings.sttDiarize);
+			this.session.savedNotePath = boundNotePath;
+			this.session.foreignNote = !!boundNotePath;
 			const segment: AudioSegment = {
 				id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
 				audioData: data,
@@ -1697,9 +1763,84 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.session.segments.push(segment);
 			this.setStatus('recorded');
 			this.refreshViews();
+			if (boundNotePath) {
+				new Notice('Vorhandene Notiz erkannt — Ergebnis wird dort eingefügt: ' + boundNotePath);
+			}
 			this.runPipeline(segment);
 		} catch (err: any) {
 			new Notice('Could not read audio file: ' + (err?.message ?? err));
+		}
+	}
+
+	/** Path of the active note, if it already embeds this exact audio file — else null. */
+	/** All audio files this note embeds, resolved to real vault files (missing links are skipped). */
+	private async findEmbeddedAudioFiles(note: TFile): Promise<TFile[]> {
+		if (note.extension !== 'md') return [];
+		const content = await this.app.vault.cachedRead(note);
+		const links = extractAudioEmbeds(content);
+		console.debug('[Scuttlebutt] findEmbeddedAudioFiles: raw embed links in', note.path, '=', links);
+		const files: TFile[] = [];
+		for (const link of links) {
+			const resolved = this.app.metadataCache.getFirstLinkpathDest(link, note.path);
+			console.debug('[Scuttlebutt]   resolve', JSON.stringify(link), '->', resolved?.path ?? 'NOT FOUND');
+			if (resolved) files.push(resolved);
+		}
+		return files;
+	}
+
+	private async findNoteEmbedding(audioFile: TFile): Promise<string | null> {
+		const active = this.app.workspace.getActiveFile();
+		if (!active) return null;
+		const embedded = await this.findEmbeddedAudioFiles(active);
+		return embedded.some((f) => f.path === audioFile.path) ? active.path : null;
+	}
+
+	/** "This note's audio": transcribe + summarize every audio file the active note already
+	 * embeds, merging the result into a marked block instead of touching anything else
+	 * the user wrote in that note. */
+	async scuttlebuttifyActiveNote(): Promise<void> {
+		if (this.recorder.isRecording()) return;
+		const file = this.app.workspace.getActiveFile();
+		if (!file || this.activeNoteAudioFiles.length === 0) {
+			new Notice('No audio embedded in the current note.');
+			return;
+		}
+		this.session = newSession(this.settings.sttDiarize);
+		this.session.savedNotePath = file.path;
+		this.session.foreignNote = true;
+
+		for (const audioFile of this.activeNoteAudioFiles) {
+			try {
+				const data = await this.app.vault.readBinary(audioFile);
+				this.session.segments.push({
+					id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
+					audioData: data,
+					audioMime: this.mimeForExtension(audioFile.extension),
+					audioName: audioFile.name,
+					audioSourcePath: audioFile.path,
+					transcript: '',
+				});
+			} catch (err: any) {
+				new Notice('Could not read ' + audioFile.name + ': ' + (err?.message ?? err));
+			}
+		}
+		if (this.session.segments.length === 0) return;
+
+		this.setStatus('recorded');
+		this.refreshViews();
+		new Notice(`Transcribing ${this.session.segments.length} recording(s) from this note…`);
+
+		for (const segment of this.session.segments) {
+			const ok = await this.transcribeStep(segment);
+			if (!ok) return;
+		}
+		if (this.settings.autoSummarize && this.settings.llmEndpoint && this.settings.llmModel) {
+			await this.summarizeInternal();
+		} else {
+			this.setStatus('recorded');
+			this.session.activeTab = 'transcript';
+			this.refreshViews();
+			await this.syncNote();
 		}
 	}
 
@@ -2082,6 +2223,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	private async writeNote(): Promise<string> {
 		const s = this.session;
+
+		if (s.foreignNote && s.savedNotePath) {
+			return await this.mergeIntoForeignNote(s.savedNotePath);
+		}
+
 		await this.ensureFolder(this.settings.notesFolder);
 
 		const now = new Date();
@@ -2147,6 +2293,61 @@ export default class ScuttlebuttPlugin extends Plugin {
 		return file.path;
 	}
 
+	/**
+	 * Merge into a note we don't own: only ever touch a marked block, plus embeds for any
+	 * segment audio not already referenced somewhere in the file. Everything else the user
+	 * wrote — title, existing embeds, handwritten notes — is left exactly as it was.
+	 */
+	private async mergeIntoForeignNote(notePath: string): Promise<string> {
+		const s = this.session;
+		const file = this.app.vault.getAbstractFileByPath(notePath);
+		if (!(file instanceof TFile)) throw new Error('Note no longer exists: ' + notePath);
+
+		// Merge the scuttlebutt flag + tags into whatever frontmatter is already there —
+		// Obsidian's own API handles this without disturbing other keys.
+		await this.app.fileManager.processFrontMatter(file, (fm) => {
+			fm.scuttlebutt = true;
+			if (s.tags.length > 0) {
+				const existing: string[] = Array.isArray(fm.tags) ? fm.tags : fm.tags ? [fm.tags] : [];
+				fm.tags = Array.from(new Set([...existing, ...s.tags]));
+			}
+		});
+
+		const content = await this.app.vault.read(file);
+
+		// Only embed segments whose audio isn't already referenced somewhere in the file —
+		// audio the user already placed there stays exactly where they put it.
+		const alreadyEmbedded = new Set(
+			extractAudioEmbeds(content)
+				.map((link) => this.app.metadataCache.getFirstLinkpathDest(link, file.path)?.path)
+				.filter((p): p is string => !!p)
+		);
+		const newAudioLinks = s.segments
+			.map((seg) => seg.audioSourcePath)
+			.filter((p): p is string => !!p && !alreadyEmbedded.has(p));
+
+		const memoContent = (await this.readLiveNoteContent()).trim() || s.memo.trim();
+		const blockParts: string[] = [];
+		for (const link of newAudioLinks) blockParts.push(`![[${link}]]`);
+		if (newAudioLinks.length > 0) blockParts.push('');
+		blockParts.push(s.summary.trim() || '*No summary generated.*');
+		if (this.settings.includeMemo && memoContent) {
+			blockParts.push('', calloutBlock('quote', 'Memo', memoContent, true));
+		}
+		if (this.settings.includeTranscript && s.transcript.trim()) {
+			blockParts.push('', calloutBlock('note', 'Transcript', s.transcript.trim(), true));
+		}
+		const block = `<!--scuttlebutt:start-->\n${blockParts.join('\n')}\n<!--scuttlebutt:end-->`;
+
+		const markerRe = /<!--scuttlebutt:start-->[\s\S]*?<!--scuttlebutt:end-->/;
+		const newContent = markerRe.test(content)
+			? content.replace(markerRe, block)
+			: content.replace(/\n*$/, '') + '\n\n' + block + '\n';
+
+		await this.app.vault.modify(file, newContent);
+		return file.path;
+	}
+
 	// ---- reset -----------------------------------------------------------
 
 	resetSession(): void {
@@ -2172,14 +2373,24 @@ export default class ScuttlebuttPlugin extends Plugin {
 		const content = await this.app.vault.read(file);
 		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
 		const fmEnd = content.indexOf('\n---', 3);
-		const body = fmEnd === -1 ? content : content.slice(fmEnd + 4).trim();
+		const fullBody = fmEnd === -1 ? content : content.slice(fmEnd + 4).trim();
+
+		// A note we merged into (rather than created) keeps its own content around our
+		// marked block — only parse summary/transcript/memo from inside that block, but
+		// still scan the whole file for audio embeds, since those live wherever the user
+		// originally put them.
+		const markerRe = /<!--scuttlebutt:start-->\n([\s\S]*?)\n<!--scuttlebutt:end-->/;
+		const markerMatch = fullBody.match(markerRe);
+		const isForeign = !!markerMatch;
+		const body = isForeign ? markerMatch![1] : fullBody;
 
 		const s = newSession(this.settings.sttDiarize);
+		s.foreignNote = isForeign;
 		s.title = file.basename.replace(/^\d{4}-\d{2}-\d{2} — /, '');
 		s.tags = Array.isArray(fm.tags) ? fm.tags.map(String) : [];
 		s.participants = Array.isArray(fm.participants) ? fm.participants.map(String) : [];
 
-		for (const link of extractAudioEmbeds(body)) {
+		for (const link of extractAudioEmbeds(fullBody)) {
 			const target = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
 			s.segments.push({
 				id: target?.path ?? link,
