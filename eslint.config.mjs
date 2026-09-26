@@ -26,7 +26,7 @@ export default [
 		},
 		rules: {
 			// Sentence-case UI text, but preserve our proper nouns and the exact-cased UI
-			// labels we reference ("New", "Save audio"), and skip strings that aren't prose:
+			// labels we reference ("New", "Save audio", "Add recording"), and skip strings that aren't prose:
 			// URL / API-key placeholders and the language-code example list.
 			'obsidianmd/ui/sentence-case': [
 				'warn',
@@ -42,6 +42,7 @@ export default [
 						'BlackHole',
 						'New',
 						'Save audio',
+						'Add recording',
 					],
 					ignoreRegex: ['^https?://', '^sk-', '\\(e\\.g\\.'],
 				},

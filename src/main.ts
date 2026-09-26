@@ -109,7 +109,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 		this.addCommand({ id: 'open-sidebar', name: 'Open sidebar', callback: () => this.activateView() });
 		this.addCommand({
 			id: 'link-active-note',
-			name: 'Link current note to Scuttlebutt',
+			name: 'Link current note',
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
 				const can = !!file && file.extension === 'md' && !this.recorder.isActive() && !this.isBusy();
@@ -165,7 +165,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 		const audioObserver = new MutationObserver((mutations) => {
 			for (const mutation of mutations) {
 				mutation.addedNodes.forEach((node) => {
-					if (!(node instanceof HTMLElement)) return;
+					if (!node.instanceOf(HTMLElement)) return;
 					if (node.tagName === 'AUDIO') fixMissingAudioDuration(node as HTMLAudioElement);
 					node.querySelectorAll?.('audio').forEach((el) => fixMissingAudioDuration(el));
 				});
