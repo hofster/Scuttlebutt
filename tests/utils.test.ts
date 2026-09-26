@@ -2,24 +2,26 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+	applyTemplate,
 	buildMultipart,
 	calloutBlock,
-	extractAudioEmbeds,
-	extractCallout,
-	extractSummaryBody,
 	formatDiarizedSegments,
 	formatDuration,
+	isNewerVersion,
 	joinUrl,
 	normalizeTag,
 	parseTagArray,
 	parseTranscriptResponse,
+	reasoningParams,
+	recordedMs,
 	responseHasSpeakers,
 	sanitizeFileName,
 	sanitizeTitle,
+	splitReasoning,
 	stripCodeFences,
+	stripThink,
 	structureSummary,
 	todayStamp,
-	recordingStamp,
 	truncate,
 	yamlString,
 } from '../src/utils';
@@ -42,11 +44,6 @@ test('formatDuration renders m:ss and h:mm:ss', () => {
 	assert.equal(formatDuration(65_000), '1:05');
 	assert.equal(formatDuration(3_661_000), '1:01:01');
 	assert.equal(formatDuration(-1000), '0:00');
-});
-
-test('recordingStamp is zero-padded local YYYYMMDDHHmmss', () => {
-	assert.equal(recordingStamp(new Date(2026, 0, 5, 9, 3, 7)), '20260105090307');
-	assert.equal(recordingStamp(new Date(2026, 11, 31, 23, 59, 59)), '20261231235959');
 });
 
 test('todayStamp is zero-padded local YYYY-MM-DD', () => {
@@ -80,6 +77,46 @@ test('stripCodeFences unwraps a fenced block, leaves plain text alone', () => {
 	assert.equal(stripCodeFences('```markdown\n# Hi\n```'), '# Hi');
 	assert.equal(stripCodeFences('```\nx\n```'), 'x');
 	assert.equal(stripCodeFences('# Hi\n- a'), '# Hi\n- a');
+});
+
+test('stripThink removes complete, truncated, and orphan-close think blocks', () => {
+	assert.equal(stripThink('<think>reasoning here</think>\n# Answer'), '# Answer');
+	assert.equal(stripThink('before <think>mid</think> after'), 'before  after');
+	// Truncated mid-think (no closing tag): the reasoning is dropped, leaving nothing.
+	assert.equal(stripThink('<think>still thinking and cut off'), '');
+	// Reasoning parser consumed the opening tag, leaving only the close.
+	assert.equal(stripThink('reasoning text</think>\nThe real answer'), 'The real answer');
+	// Plain content is untouched.
+	assert.equal(stripThink('# Just a summary\n- a'), '# Just a summary\n- a');
+});
+
+test('splitReasoning separates answer from thinking across all tag shapes', () => {
+	assert.deepEqual(splitReasoning('<think>hmm</think>\n# Answer'), { answer: '# Answer', reasoning: 'hmm' });
+	// Dangling open (still streaming / truncated): answer so far, rest is reasoning.
+	assert.deepEqual(splitReasoning('intro <think>still going'), { answer: 'intro', reasoning: 'still going' });
+	// Orphan close (parser consumed the open tag): before is reasoning, after is answer.
+	assert.deepEqual(splitReasoning('reasoning</think>real answer'), {
+		answer: 'real answer',
+		reasoning: 'reasoning',
+	});
+	// No tags at all.
+	assert.deepEqual(splitReasoning('just an answer'), { answer: 'just an answer', reasoning: '' });
+});
+
+test('reasoningParams disables thinking when off and reserves headroom otherwise', () => {
+	const off = reasoningParams('off');
+	assert.equal(off.headroom, 0);
+	assert.deepEqual(off.params, { chat_template_kwargs: { enable_thinking: false } });
+	assert.equal((off.params as any).reasoning_effort, undefined);
+
+	const high = reasoningParams('high');
+	assert.equal(high.headroom, 8192);
+	assert.equal((high.params as any).reasoning_effort, 'high');
+	assert.deepEqual((high.params as any).chat_template_kwargs, { enable_thinking: true });
+
+	// Headroom scales with the effort ladder.
+	assert.ok(reasoningParams('low').headroom < reasoningParams('max').headroom);
+	assert.equal(reasoningParams('max').headroom, 32768);
 });
 
 test('parseTagArray extracts arrays, even from surrounding prose', () => {
@@ -140,6 +177,9 @@ test('yamlString quotes only when needed', () => {
 	assert.equal(yamlString('Has: colon'), '"Has: colon"');
 	assert.equal(yamlString('quote"inside'), '"quote\\"inside"');
 	assert.equal(yamlString(' leading'), '" leading"');
+	// Backslashes must be escaped before quotes, or the double-quoted scalar is invalid YAML.
+	assert.equal(yamlString('C:\\Users'), '"C:\\\\Users"');
+	assert.equal(yamlString('a\\"b'), '"a\\\\\\"b"');
 });
 
 test('calloutBlock prefixes every line and handles blanks', () => {
@@ -184,24 +224,48 @@ test('buildMultipart produces a well-formed body and boundary', () => {
 	assert.ok(decoded.includes(`--${boundary}--`));
 });
 
-test('extractAudioEmbeds finds only audio embeds, in order', () => {
-	const body = '![[Recording 1.webm]]\n![[Recording 2.m4a]]\n![[chart.png]]\n[[Recording 1.webm]]';
-	assert.deepEqual(extractAudioEmbeds(body), ['Recording 1.webm', 'Recording 2.m4a']);
+test('recordedMs sums banked time and the live segment', () => {
+	assert.equal(recordedMs(0, 1000, 4000), 3000); // running: 3s into first segment
+	assert.equal(recordedMs(5000, 2000, 3000), 6000); // 5s banked + 1s live
 });
 
-test('extractCallout round-trips what calloutBlock wrote, including blank lines', () => {
-	const original = 'Line one.\n\nLine two.';
-	const block = calloutBlock('note', 'Transcript', original, true);
-	const body = `# Title\n\nSome summary.\n\n${block}\n`;
-	assert.equal(extractCallout(body, 'note', 'Transcript'), original);
+test('recordedMs freezes while paused (null segment)', () => {
+	assert.equal(recordedMs(5000, null, 999999), 5000);
+	assert.equal(recordedMs(0, null, 999999), 0);
 });
 
-test('extractCallout returns null when the callout is absent', () => {
-	assert.equal(extractCallout('# Title\n\nJust a summary, no callouts.', 'quote', 'Memo'), null);
+test('recordedMs handles multiple banked pauses', () => {
+	assert.equal(recordedMs(5000, 10000, 11500), 6500); // 5s banked + 1.5s live
 });
 
-test('extractSummaryBody strips leading audio embeds and stops before the first callout', () => {
-	const body =
-		'![[Recording 1.webm]]\n![[Recording 2.webm]]\n\n# Title\n\nOverview text.\n\n> [!note]- Transcript\n> hi';
-	assert.equal(extractSummaryBody(body), '# Title\n\nOverview text.');
+test('recordedMs never goes negative on clock skew', () => {
+	assert.equal(recordedMs(0, 5000, 4000), 0); // now < segment start
+	assert.equal(recordedMs(1000, 5000, 4000), 1000); // banked kept, live clamped to 0
+});
+
+test('applyTemplate substitutes tokens and blanks unknown ones', () => {
+	assert.equal(applyTemplate('{{date}} - {{title}}', { date: '2026-09-09', title: 'Sync' }), '2026-09-09 - Sync');
+	assert.equal(applyTemplate('{{ title }}', { title: 'Spaced' }), 'Spaced'); // tolerant of inner spaces
+	assert.equal(applyTemplate('{{title}} ({{missing}})', { title: 'X' }), 'X ()'); // unknown -> empty
+	assert.equal(applyTemplate('no tokens', {}), 'no tokens');
+});
+
+test('isNewerVersion compares dotted versions', () => {
+	assert.equal(isNewerVersion('1.3.0', '1.2.5'), true);
+	assert.equal(isNewerVersion('1.2.10', '1.2.9'), true); // numeric, not lexical
+	assert.equal(isNewerVersion('2.0.0', '1.9.9'), true);
+	assert.equal(isNewerVersion('1.2.0', '1.2.0'), false); // equal
+	assert.equal(isNewerVersion('1.1.9', '1.2.0'), false); // older
+});
+
+test('isNewerVersion tolerates a v-prefix and shorter versions', () => {
+	assert.equal(isNewerVersion('v1.3.0', '1.2.0'), true);
+	assert.equal(isNewerVersion('1.2', '1.2.0'), false); // 1.2 == 1.2.0
+	assert.equal(isNewerVersion('1.2.1', '1.2'), true); // missing parts treated as 0
+});
+
+test('isNewerVersion returns false for malformed versions (never nags)', () => {
+	assert.equal(isNewerVersion('latest', '1.2.0'), false);
+	assert.equal(isNewerVersion('1.2.x', '1.2.0'), false);
+	assert.equal(isNewerVersion('', '1.2.0'), false);
 });

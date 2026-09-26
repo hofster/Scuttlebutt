@@ -4,6 +4,141 @@ All notable changes to Scuttlebutt are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - Safe Harbor (2026-09-09)
+
+### Added
+
+- Settings are now organized into tabs (General, Transcription, Summary, Capture,
+  Output) that switch instantly, replacing the navigable pages.
+- Configurable token budgets: set the summary length limit and the per-level
+  reasoning headroom that used to be fixed. Kept in an "advanced" section,
+  collapsed by default, with a note that too-small budgets can truncate output.
+- Note filename template with {{date}} and {{title}} tokens and a live preview,
+  so you control how saved notes are named.
+- Built-in update check: once a day Scuttlebutt checks GitHub for a newer release
+  and, if there is one, shows a notice with a jump to Community plugins. A new
+  General tab shows the installed version and a toggle to turn checks off.
+- A reset-to-default button on every free-text and numeric setting.
+
+### Changed
+
+- Default transcription language is now "auto" (the server detects the spoken
+  language) instead of English.
+- Bumped the CI and release GitHub Actions off the deprecated Node 20 runtime.
+
+### Security
+
+- API keys (transcription and summary) are now stored in Obsidian's secret
+  storage, backed by your operating system's keychain, instead of the plugin's
+  data.json. A key saved by an earlier version is migrated automatically on first
+  launch and scrubbed from data.json.
+
+### Fixed
+
+- Settings dropdowns no longer stretch to fit the selected option; they keep a
+  consistent width.
+
+## [1.1.1] - Careened (2026-09-09)
+
+### Changed
+
+- Settings now use Obsidian's declarative settings API (1.13+): every setting
+  is indexed by Obsidian's settings search, and the four sections
+  (Transcription, Summary, Capture, Output) are navigable pages. Recording,
+  transcription, and summarizing behavior is unchanged.
+- Raised the minimum Obsidian version to 1.13.0, required by the declarative
+  settings API and the sidebar reveal API. Users on older Obsidian continue to
+  receive 1.1.0.
+- The release workflow now runs ESLint (Obsidian's plugin-review ruleset), and a
+  new CI workflow lints, typechecks, and tests on every push and pull request, so
+  review issues are caught before a release is cut.
+
+### Fixed
+
+- Switching to the Transcript or Memo tab while a summary was streaming made the
+  whole sidebar flicker (it re-rendered on every token). Streaming now updates in
+  place only on the Summary tab.
+- Resolved every Obsidian plugin-review finding, with no change in behavior:
+  replaced direct element style assignment with CSS classes, dropped use of APIs
+  newer than the declared minimum version, tightened types to remove unsafe `any`
+  handling of network and JSON data, cleaned up redundant regex escapes, and
+  explicitly marked intentionally un-awaited promises.
+
+## [1.1.0] - Squared Away (2026-09-09)
+
+### Added
+
+- **Pause and resume a recording.** A split control in the sidebar (Pause/Resume
+  and Stop) and a "Pause / resume recording" command (bindable to a hotkey) let
+  you pause an in-progress recording and pick it back up later. The recording is
+  captured as one continuous file and transcribed as a single clip.
+
+### Changed
+
+- Releases are now built and published by GitHub Actions with build provenance
+  attestations for main.js, manifest.json, and styles.css.
+- Added a Data and privacy section to the README covering what the plugin
+  accesses locally and what it sends to your configured servers.
+- Added a strict TypeScript typecheck to the build and pinned the Obsidian API
+  version for reproducible builds.
+
+### Fixed
+
+- Recording duration (in the timer, status bar, and saved filename) now excludes
+  paused time, so it reflects the actual recorded audio length.
+- Saving is blocked while a transcription or summary is still running, so a
+  partial summary can no longer be saved as a finished note.
+- "New" during a running job now asks for confirmation and cancels the job
+  cleanly instead of silently discarding it.
+- Cancelling a job and immediately starting another no longer shows a phantom
+  error or breaks the new job's Cancel button.
+- Starting a recording twice in quick succession no longer leaves the microphone
+  captured in the background.
+- "Save again" now offers to replace the existing note in place instead of
+  always creating a numbered copy.
+- Frontmatter values containing backslashes are escaped correctly, so notes with
+  such titles or participants stay valid.
+- A slow but healthy streaming summary is no longer cut off by the request
+  timeout; only a genuine stall (no output for the timeout window) times out.
+- Editing settings no longer rebuilds the sidebar and its audio player on every
+  keystroke.
+
+## [1.0.4] — Loose Lips (2026-09-07)
+
+### Added
+
+- **Streaming summaries.** The summary now streams in token by token instead of
+  appearing all at once — far less waiting on slower local models. Toggle it in
+  Settings → Summary ("Stream summary", on by default) or per recording. Falls
+  back to a single request automatically on servers that can't stream.
+- **Model thinking, shown separately.** For reasoning models (e.g. Qwen3), the
+  `<think>` reasoning is captured and shown in a collapsible "Model thinking"
+  section under the summary — hidden by default, and streamed live when enabled.
+  It's never written into the saved note.
+- **Reasoning effort control.** A new "Reasoning effort" setting (Off / Low /
+  Medium / High / Extra high / Max), also available per recording. "Off" disables
+  thinking (recommended for summaries); higher levels enable it and reserve token
+  headroom so the reasoning never crowds out the answer.
+- **Regenerate title or tags on their own.** Small refresh buttons beside the
+  Title and Tags fields re-run just that piece from the current summary.
+- **Run options.** The per-recording controls (Identify speakers · Thinking ·
+  Stream summary) now live in one collapsible "Run options" section in the
+  sidebar. They seed from your settings and stick until you press "New".
+
+### Changed
+
+- Default request timeouts are now 300 s for both Transcription and Summary.
+- Dropdowns are a consistent fixed width that no longer resizes with the selected
+  option, and shrink to fit a narrow pane instead of squishing labels.
+- The input-device list is cached, so your selected devices show immediately after
+  a reload without having to re-detect them.
+
+### Fixed
+
+- **Thinking models no longer return a blank summary, title, and tags.** Models
+  like Qwen3 spent the whole token budget on `<think>` and returned nothing;
+  their reasoning is now stripped from the answer and given its own headroom.
+
 ## [1.0.3] — All Hands (2026-08-12)
 
 ### Added

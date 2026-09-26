@@ -6,7 +6,7 @@ const context = {
   entryPoints: ['src/main.ts'],
   bundle: true,
   outfile: 'main.js',
-  external: ['obsidian'],
+  external: ['obsidian', 'child_process', 'os'],
   format: 'cjs',
   target: 'es2018',
   sourcemap: true,

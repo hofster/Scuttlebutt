@@ -11,1426 +11,132 @@
  * Local-first. Everything runs against endpoints you configure. No cloud, no accounts.
  */
 
+import { Notice, Platform, Plugin, TFile, normalizePath, requestUrl } from 'obsidian';
 import {
-	App,
-	Component,
-	DropdownComponent,
-	FuzzySuggestModal,
-	ItemView,
-	MarkdownRenderer,
-	Notice,
-	Plugin,
-	PluginSettingTab,
-	Setting,
-	TextAreaComponent,
-	TextComponent,
-	TFile,
-	WorkspaceLeaf,
-	moment,
-	normalizePath,
-	requestUrl,
-	setIcon,
-} from 'obsidian';
-import {
-	buildMultipart,
+	applyTemplate,
 	calloutBlock,
+	DEFAULT_REASONING_BUDGETS,
+	errorMessage,
 	extractAudioEmbeds,
 	extractCallout,
 	extractSummaryBody,
+	fixMissingAudioDuration,
 	formatDuration,
-	joinUrl,
-	normalizeTag,
-	parseTagArray,
-	parseTranscriptResponse,
+	isNewerVersion,
+	isRecord,
+	recordedMs,
 	recordingStamp,
-	responseHasSpeakers,
 	sanitizeFileName,
-	sanitizeTitle,
-	stripCodeFences,
+	str,
 	structureSummary,
 	todayStamp,
-	truncate,
 	yamlString,
 } from './utils';
-
-// ---------------------------------------------------------------------------
-// Settings
-// ---------------------------------------------------------------------------
-
-interface ModelOption {
-	id: string;
-	name: string;
-}
-
-interface ScuttlebuttSettings {
-	// Transcription endpoint (Whisper / vLLM)
-	sttEndpoint: string;
-	sttApiKey: string;
-	sttModel: string;
-	sttModels: ModelOption[];
-	sttLanguage: string;
-	sttDiarize: boolean;
-	sttTimeout: number; // seconds; 0 = wait indefinitely
-
-	// Summary endpoint (LLM / vLLM)
-	llmEndpoint: string;
-	llmApiKey: string;
-	llmModel: string;
-	llmModels: ModelOption[];
-	llmTimeout: number; // seconds; 0 = wait indefinitely
-
-	// Prompts / language
-	summaryPrompt: string;
-	language: string;
-
-	// Capture
-	captureSystemAudio: boolean;
-	inputDeviceId: string;
-	systemAudioDeviceId: string; // optional loopback input mixed in alongside the mic
-
-	// Output
-	notesFolder: string;
-	audioFolder: string;
-	dateFormat: string;
-	saveAudio: boolean;
-	includeTranscript: boolean;
-	includeMemo: boolean;
-	autoSummarize: boolean;
-	autoOpenNote: boolean;
-	generateTags: boolean;
-	generateTitle: boolean;
-	defaultTags: string[];
-}
-
-const DEFAULT_DATE_FORMAT = 'dddd, MMMM Do YYYY, h:mm:ss a';
-
-const DEFAULT_SUMMARY_PROMPT = `# General Instructions
-
-You are an expert at creating structured, comprehensive meeting summaries in {{language}}. Maintain accuracy, completeness, and professional terminology.
-
-# Output Structure
-
-- Write a short overview first: a 2–4 sentence paragraph (no heading of its own) summarizing the whole meeting — its purpose, key outcomes, and decisions. This overview is required.
-- After the overview, organize the details into sections, each introduced by a second-level ("##") heading (use "###" only for sub-points).
-- Do NOT write your own first-level ("#") heading — a single title heading is added for you automatically. Every heading you write must be "##" or smaller.
-- Under each section, use bullet points for specific discussion details, decisions, and key points.
-- Include a "## Action items" section when there are any, noting owners where known.
-
-# Format Requirements
-
-- Use Markdown without code block wrappers.
-- Keep bullets concrete and specific; avoid nesting beyond one level of indentation.
-- Your final output MUST be ONLY the markdown summary itself — no preamble, no commentary, no "Here's the summary".
-
-# Guidelines
-
-- Notes and transcript may contain errors made by humans and speech-to-text respectively. Make the best of every material.
-- Do not restate the meeting title or attendee lists as body content.
-- Use the reference notes and memo to understand intent and agenda; weave them into the relevant sections.
-- Preserve essential details; keep content concrete and specific.`;
-
-const DEFAULT_SETTINGS: ScuttlebuttSettings = {
-	sttEndpoint: 'http://localhost:8000/v1',
-	sttApiKey: '',
-	sttModel: '',
-	sttModels: [],
-	sttLanguage: 'en',
-	sttDiarize: false,
-	sttTimeout: 180,
-
-	llmEndpoint: 'http://localhost:8000/v1',
-	llmApiKey: '',
-	llmModel: '',
-	llmModels: [],
-	llmTimeout: 120,
-
-	summaryPrompt: DEFAULT_SUMMARY_PROMPT,
-	language: 'English',
-
-	captureSystemAudio: false,
-	inputDeviceId: '',
-	systemAudioDeviceId: '',
-
-	notesFolder: 'Scuttlebutt/Notes',
-	audioFolder: 'Scuttlebutt/Audio',
-	dateFormat: DEFAULT_DATE_FORMAT,
-	saveAudio: true,
-	includeTranscript: true,
-	includeMemo: true,
-	autoSummarize: true,
-	autoOpenNote: false,
-	generateTags: true,
-	generateTitle: true,
-	defaultTags: [
-		'Sales',
-		'User-Interview',
-		'Product',
-		'Marketing',
-		'Engineering',
-		'Customer-Support',
-		'Research',
-		'Insight',
-		'Design',
-		'Recruiting',
-	],
-};
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-const TEST_TIMEOUT = 10_000;
-
-// Race a promise against a timeout. `ms <= 0` disables the timeout (wait
-// indefinitely) — used when a server's timeout is configured to 0.
-function withTimeout<T>(promise: Promise<T>, ms: number, label = 'Request'): Promise<T> {
-	if (!ms || ms <= 0) return promise;
-	return Promise.race([
-		promise,
-		new Promise<T>((_, reject) =>
-			window.setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms)
-		),
-	]);
-}
-
-// ---------------------------------------------------------------------------
-// Endpoint testing / model discovery
-// ---------------------------------------------------------------------------
-
-interface TestResult {
-	ok: boolean;
-	message: string;
-	models: ModelOption[];
-}
-
-async function testEndpoint(endpoint: string, apiKey: string): Promise<TestResult> {
-	if (!endpoint || !endpoint.trim()) {
-		return { ok: false, message: 'No endpoint URL set', models: [] };
-	}
-	try {
-		const headers: Record<string, string> = {};
-		if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-		const resp = await withTimeout(
-			requestUrl({ url: joinUrl(endpoint, 'models'), method: 'GET', headers, throw: false }),
-			TEST_TIMEOUT,
-			'Test'
-		);
-		if (resp.status < 200 || resp.status >= 300) {
-			return { ok: false, message: `HTTP ${resp.status}: ${truncate(resp.text, 120)}`, models: [] };
-		}
-		let data: any;
-		try {
-			data = resp.json;
-		} catch {
-			return { ok: false, message: 'Endpoint replied but not with JSON — check the URL ends in /v1', models: [] };
-		}
-		const list: ModelOption[] = (data?.data ?? [])
-			.map((m: any) => ({ id: String(m.id), name: String(m.id) }))
-			.filter((m: ModelOption) => m.id);
-		if (list.length === 0) {
-			return { ok: false, message: 'Connected, but the server listed no models', models: [] };
-		}
-		return { ok: true, message: `${list.length} model${list.length === 1 ? '' : 's'} available`, models: list };
-	} catch (err: any) {
-		return { ok: false, message: err?.message ?? String(err), models: [] };
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Recorder
-// ---------------------------------------------------------------------------
-
-class MeetingRecorder {
-	private mediaRecorder: MediaRecorder | null = null;
-	private stream: MediaStream | null = null;
-	private sources: MediaStream[] = [];
-	private audioContext: AudioContext | null = null;
-	private chunks: Blob[] = [];
-	private mimeType = 'audio/webm';
-	// Some systems need a moment to fully release a mic device after it's stopped;
-	// starting a new getUserMedia() too soon can silently yield an empty recording
-	// (observed when starting a second take right after the first, via "Add recording").
-	private lastStopAt = 0;
-	private static readonly MIN_GAP_MS = 1000;
-	// Set synchronously at the top of start(), before any await — closes the race where
-	// a second start() call (e.g. an impatient double-click) sees isRecording() still
-	// false (no MediaRecorder exists yet) and runs concurrently with the first, corrupting
-	// shared state so both end up with zero audio data.
-	private starting = false;
-
-	// Called if any input track ends unexpectedly while a recording is active — this
-	// has been observed in the wild (a track's readyState silently flips to 'ended'
-	// mid-recording, with zero further data, and no error thrown). We can't recover
-	// the lost audio, but we can tell the user right away instead of after a long
-	// silent recording.
-	onUnexpectedEnd: ((trackLabel: string) => void) | null = null;
-
-	static readonly ALREADY_STARTING = 'A recording is already starting or in progress.';
-
-	// Relative timestamps (ms since this recorder was created) — easier to eyeball
-	// elapsed time between log lines than raw epoch millis.
-	private readonly t0 = Date.now();
-	private log(...args: unknown[]): void {
-		console.debug(`[Scuttlebutt +${Date.now() - this.t0}ms]`, ...args);
-	}
-
-	isRecording(): boolean {
-		return this.mediaRecorder?.state === 'recording';
-	}
-
-	async start(opts: {
-		inputDeviceId?: string;
-		systemAudioDeviceId?: string;
-		captureSystemAudio: boolean;
-	}): Promise<{ systemAudio: boolean }> {
-		if (this.starting || this.isRecording()) {
-			throw new Error(MeetingRecorder.ALREADY_STARTING);
-		}
-		this.starting = true;
-		try {
-			return await this.doStart(opts);
-		} finally {
-			this.starting = false;
-		}
-	}
-
-	private async doStart(opts: {
-		inputDeviceId?: string;
-		systemAudioDeviceId?: string;
-		captureSystemAudio: boolean;
-	}): Promise<{ systemAudio: boolean }> {
-		const sinceStop = Date.now() - this.lastStopAt;
-		if (this.lastStopAt > 0 && sinceStop < MeetingRecorder.MIN_GAP_MS) {
-			await new Promise((r) => window.setTimeout(r, MeetingRecorder.MIN_GAP_MS - sinceStop));
-		}
-		// Microphone — the base track. Mic processing (echo cancellation, noise
-		// suppression) is on; a system/loopback source below is captured raw so that
-		// processing doesn't gate it.
-		const micConstraints: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true };
-		if (opts.inputDeviceId) micConstraints.deviceId = { exact: opts.inputDeviceId };
-		const micStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: micConstraints });
-		this.log(
-			'mic acquired:',
-			micStream.getAudioTracks().map((t) => ({ label: t.label, readyState: t.readyState, muted: t.muted, enabled: t.enabled }))
-		);
-		for (const track of micStream.getAudioTracks()) {
-			track.addEventListener('ended', () => {
-				if (this.mediaRecorder?.state === 'recording') {
-					this.log('WARNING: track ended unexpectedly mid-recording:', track.label);
-					this.onUnexpectedEnd?.(track.label);
-				}
-			});
-		}
-		this.sources = [micStream];
-		let systemAudio = false;
-
-		// System audio as a second *input* device (e.g. a BlackHole/aggregate loopback
-		// on macOS). This is the reliable way to capture system/meeting audio; it's
-		// mixed with the mic into one track.
-		if (opts.systemAudioDeviceId && opts.systemAudioDeviceId !== opts.inputDeviceId) {
-			try {
-				const sysStream = await navigator.mediaDevices.getUserMedia({
-					video: false,
-					audio: { deviceId: { exact: opts.systemAudioDeviceId } },
-				});
-				this.sources.push(sysStream);
-				systemAudio = true;
-			} catch {
-				/* device unavailable — degrade to whatever else we have */
-			}
-		}
-
-		// System audio via a screen-share prompt (works on some platforms, not reliably
-		// on macOS). Kept as an alternative to the loopback-device route above.
-		if (opts.captureSystemAudio) {
-			try {
-				const screen = await navigator.mediaDevices
-					.getDisplayMedia({ video: true, audio: true })
-					.catch(() => null);
-				if (screen) {
-					if (screen.getAudioTracks().length > 0) {
-						this.sources.push(new MediaStream(screen.getAudioTracks()));
-						systemAudio = true;
-					}
-					screen.getVideoTracks().forEach((t) => t.stop());
-				}
-			} catch {
-				/* ignore — degrade gracefully */
-			}
-		}
-
-		// A single source records directly; multiple sources are mixed into one track.
-		this.stream = this.sources.length > 1 ? this.mix(this.sources) : micStream;
-
-		const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
-		this.mimeType = candidates.find((t) => MediaRecorder.isTypeSupported(t)) ?? 'audio/webm';
-
-		this.mediaRecorder = new MediaRecorder(this.stream, { mimeType: this.mimeType });
-		this.chunks = [];
-		const trackAtStart = this.stream.getAudioTracks()[0];
-		this.log('MediaRecorder constructed, mimeType =', this.mimeType, 'track live? ', trackAtStart?.readyState, trackAtStart?.muted ? '(muted)' : '(unmuted)');
-		this.mediaRecorder.ondataavailable = (e) => {
-			const t = this.stream?.getAudioTracks()[0];
-			this.log('ondataavailable, size =', e.data?.size ?? 0, 'recorder.state =', this.mediaRecorder?.state, 'track:', t?.readyState, t?.muted);
-			if (e.data && e.data.size > 0) this.chunks.push(e.data);
-		};
-		this.mediaRecorder.onerror = (e) => this.log('MediaRecorder onerror:', e);
-		this.mediaRecorder.start(1000);
-		this.log('mediaRecorder.start(1000) called, state =', this.mediaRecorder.state);
-		return { systemAudio };
-	}
-
-	/** Mix several audio streams down to a single MediaStream via the Web Audio graph. */
-	private mix(streams: MediaStream[]): MediaStream {
-		this.audioContext = new AudioContext();
-		const dest = this.audioContext.createMediaStreamDestination();
-		for (const s of streams) {
-			for (const track of s.getAudioTracks()) {
-				this.audioContext.createMediaStreamSource(new MediaStream([track])).connect(dest);
-			}
-		}
-		return dest.stream;
-	}
-
-	stop(): Promise<Blob> {
-		return new Promise((resolve) => {
-			if (!this.mediaRecorder) {
-				this.log('stop() called but mediaRecorder is null');
-				resolve(new Blob());
-				return;
-			}
-			const t = this.stream?.getAudioTracks()[0];
-			this.log('stop() called, recorder.state =', this.mediaRecorder.state, 'chunks so far =', this.chunks.length, 'track:', t?.readyState, t?.muted);
-			this.mediaRecorder.onstop = () => {
-				this.log('onstop fired, total chunks =', this.chunks.length, 'sizes =', this.chunks.map((c) => c.size));
-				const blob = new Blob(this.chunks, { type: this.mimeType });
-				this.cleanup();
-				resolve(blob);
-			};
-			this.mediaRecorder.stop();
-		});
-	}
-
-	getMimeType(): string {
-		return this.mimeType;
-	}
-
-	private cleanup() {
-		// Stop every raw source (mic + any system/loopback + display) as well as the
-		// final (possibly mixed) stream, so no device is left in use.
-		for (const s of this.sources) {
-			for (const track of s.getTracks()) track.stop();
-		}
-		this.sources = [];
-		if (this.stream) {
-			for (const track of this.stream.getTracks()) track.stop();
-			this.stream = null;
-		}
-		if (this.audioContext) {
-			this.audioContext.close().catch(() => {});
-			this.audioContext = null;
-		}
-		this.mediaRecorder = null;
-		this.chunks = [];
-		this.lastStopAt = Date.now();
-	}
-
-	abort() {
-		if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-			try {
-				this.mediaRecorder.stop();
-			} catch {
-				/* ignore */
-			}
-		}
-		this.cleanup();
-	}
-}
-
-// ---------------------------------------------------------------------------
-// AI services (transcribe / summarize / title / tags)
-// ---------------------------------------------------------------------------
-
-class AIService {
-	constructor(private settings: ScuttlebuttSettings) {}
-
-	private ensureStt() {
-		if (!this.settings.sttEndpoint?.trim()) {
-			throw new Error('Transcription endpoint is not set. Open Settings → Scuttlebutt.');
-		}
-		if (!this.settings.sttModel) {
-			throw new Error('No transcription model selected. Test the endpoint in Settings and pick a model.');
-		}
-	}
-
-	private ensureLlm() {
-		if (!this.settings.llmEndpoint?.trim()) {
-			throw new Error('Summary endpoint is not set. Open Settings → Scuttlebutt.');
-		}
-		if (!this.settings.llmModel) {
-			throw new Error('No summary model selected. Test the endpoint in Settings and pick a model.');
-		}
-	}
-
-	/**
-	 * POST and return the raw status + body text. Uses `fetch` so the request can be
-	 * aborted mid-flight via `signal` (that's the whole point — Obsidian's requestUrl
-	 * can't be cancelled). If fetch fails for a reason that ISN'T an abort or timeout —
-	 * typically a server that doesn't send CORS headers — it falls back to requestUrl,
-	 * which is CORS-immune but uncancellable, so existing setups keep working.
-	 */
-	private async request(
-		url: string,
-		headers: Record<string, string>,
-		body: ArrayBuffer | string,
-		timeoutMs: number,
-		label: string,
-		signal?: AbortSignal
-	): Promise<{ status: number; text: string }> {
-		const controller = new AbortController();
-		const onExternalAbort = () => controller.abort();
-		if (signal) {
-			if (signal.aborted) controller.abort();
-			else signal.addEventListener('abort', onExternalAbort, { once: true });
-		}
-		let timedOut = false;
-		const timer =
-			timeoutMs > 0
-				? window.setTimeout(() => {
-						timedOut = true;
-						controller.abort();
-				  }, timeoutMs)
-				: null;
-		try {
-			const resp = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
-			return { status: resp.status, text: await resp.text() };
-		} catch (err) {
-			if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
-			if (timedOut) throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
-			// Not an abort and not a timeout — most often a CORS/network failure. Retry
-			// through requestUrl (no CORS check, but no cancellation either).
-			const resp = await withTimeout(
-				requestUrl({ url, method: 'POST', headers, body, throw: false }),
-				timeoutMs,
-				label
-			);
-			return { status: resp.status, text: resp.text };
-		} finally {
-			if (timer !== null) window.clearTimeout(timer);
-			if (signal) signal.removeEventListener('abort', onExternalAbort);
-		}
-	}
-
-	async transcribe(
-		data: ArrayBuffer,
-		filename: string,
-		mime: string,
-		diarize: boolean,
-		signal?: AbortSignal
-	): Promise<{ text: string; hasSpeakers: boolean }> {
-		this.ensureStt();
-		const fields: Record<string, string> = { model: this.settings.sttModel };
-		const lang = this.settings.sttLanguage?.trim();
-		if (lang && lang.toLowerCase() !== 'auto') fields.language = lang;
-		// Ask the endpoint to identify speakers. A diarizing server (e.g. the bundled
-		// WhisperX one) returns per-segment speaker labels, which parseTranscriptResponse
-		// renders as turns. Most other servers ignore `diarize`; `verbose_json` is the
-		// one field a few endpoints reject, which is why the caller can retry without it.
-		if (diarize) {
-			fields.diarize = 'true';
-			fields.response_format = 'verbose_json';
-		}
-
-		const { body, contentType } = buildMultipart(fields, { field: 'file', filename, type: mime, data });
-		const headers: Record<string, string> = { 'Content-Type': contentType };
-		if (this.settings.sttApiKey) headers['Authorization'] = 'Bearer ' + this.settings.sttApiKey;
-
-		const resp = await this.request(
-			joinUrl(this.settings.sttEndpoint, 'audio/transcriptions'),
-			headers,
-			body,
-			this.settings.sttTimeout * 1000,
-			'Transcription',
-			signal
-		);
-		if (resp.status < 200 || resp.status >= 300) {
-			throw new Error(`Transcription failed (HTTP ${resp.status}): ${truncate(resp.text, 200)}`);
-		}
-		return { text: parseTranscriptResponse(resp.text), hasSpeakers: responseHasSpeakers(resp.text) };
-	}
-
-	private async chat(
-		system: string,
-		user: string,
-		maxTokens: number,
-		temperature: number,
-		signal?: AbortSignal
-	): Promise<string> {
-		this.ensureLlm();
-		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-		if (this.settings.llmApiKey) headers['Authorization'] = 'Bearer ' + this.settings.llmApiKey;
-		const resp = await this.request(
-			joinUrl(this.settings.llmEndpoint, 'chat/completions'),
-			headers,
-			JSON.stringify({
-				model: this.settings.llmModel,
-				messages: [
-					{ role: 'system', content: system },
-					{ role: 'user', content: user },
-				],
-				max_tokens: maxTokens,
-				temperature,
-			}),
-			this.settings.llmTimeout * 1000,
-			'Summary',
-			signal
-		);
-		if (resp.status < 200 || resp.status >= 300) {
-			throw new Error(`LLM request failed (HTTP ${resp.status}): ${truncate(resp.text, 200)}`);
-		}
-		let data: any;
-		try {
-			data = JSON.parse(resp.text);
-		} catch {
-			throw new Error('LLM endpoint returned a non-JSON response.');
-		}
-		return String(data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? '').trim();
-	}
-
-	async summarize(
-		input: {
-			transcript: string;
-			memo: string;
-			participants: string;
-			contextDocs: { path: string; content: string }[];
-		},
-		signal?: AbortSignal
-	): Promise<string> {
-		const system = this.settings.summaryPrompt.replace(/\{\{\s*language\s*\}\}/g, this.settings.language || 'English');
-		const parts: string[] = [];
-		parts.push('# Context');
-		parts.push(`Current date: ${todayStamp(new Date())}`);
-		if (input.participants.trim()) parts.push(`Participants: ${input.participants.trim()}`);
-
-		if (input.contextDocs.length > 0) {
-			parts.push('\n# Reference Notes');
-			for (const doc of input.contextDocs) {
-				parts.push(`\n## ${doc.path}\n${doc.content.trim()}`);
-			}
-		}
-		if (input.memo.trim()) {
-			parts.push('\n# Meeting Notes (Memo)');
-			parts.push(input.memo.trim());
-		}
-		parts.push('\n# Transcript');
-		parts.push(input.transcript.trim() || '(empty)');
-
-		const summary = await this.chat(system, parts.join('\n'), 8192, 0.3, signal);
-		return stripCodeFences(summary);
-	}
-
-	async generateTitle(content: string, signal?: AbortSignal): Promise<string> {
-		const language = this.settings.language || 'English';
-		const system =
-			`Current date: ${todayStamp(new Date())}\n\n` +
-			`You are a professional assistant that generates a perfect title for a meeting note, in ${language}.\n\n` +
-			`# Format Requirements\n` +
-			`- Only output the title as plaintext, nothing else. No characters like *"'([{}]):.\n` +
-			`- Never ask questions or request more information.\n` +
-			`- If the note is empty or has no meaningful content, output exactly: <EMPTY>`;
-		const user = `<note>\n${content}\n</note>\n\nNow, give me a SUPER CONCISE title for the above note. Only about the topic of the meeting.`;
-		const out = (await this.chat(system, user, 64, 0.3, signal)).trim();
-		if (!out || out === '<EMPTY>') return '';
-		const title = sanitizeTitle(out);
-		// Defensive: some models occasionally regurgitate memorized code-corpus metadata
-		// (e.g. "<reponame>...<file_sep>...") instead of a real title for this exact task.
-		// A genuine title is short prose — reject anything that looks like that instead.
-		if (title.length > 100 || /repo_?name|file_sep|gh_stars|<filename>/i.test(out)) {
-			return '';
-		}
-		return title;
-	}
-
-	async generateTags(
-		title: string,
-		content: string,
-		historicalTags: string[],
-		signal?: AbortSignal
-	): Promise<string[]> {
-		const defaults = this.settings.defaultTags.join(', ');
-		const system =
-			`You are an intelligent tagging assistant. Suggest 3–5 concise, specific tags for a meeting note.\n\n` +
-			`## How to choose (in this order)\n` +
-			`1. FIRST review the user's existing vault tags (listed in the prompt). Reuse any that genuinely fit the content, and return them EXACTLY as written — same spelling and case.\n` +
-			`2. Only for aspects no existing tag covers, consider these defaults: [${defaults}].\n` +
-			`3. Only invent a brand-new tag when neither an existing tag nor a default fits.\n\n` +
-			`## Rules\n` +
-			`- Return 3 to 5 tags total.\n` +
-			`- Prefer an existing tag over a near-duplicate (e.g. do not add "planning" if "Planning" already exists).\n` +
-			`- Avoid generic tags like "note", "meeting", or "content".\n` +
-			`- Make tags specific: people, projects, tools, concepts, workflows.\n\n` +
-			`## Response Format\n` +
-			`Return ONLY a JSON array of strings, nothing else. Example: ["Engineering", "project-alpha"]`;
-		const existing =
-			historicalTags.length > 0
-				? `## Existing tags in the vault (reuse these when they fit)\n${historicalTags.join(', ')}\n\n`
-				: '## Existing tags in the vault\n(none yet)\n\n';
-		const user = `${existing}## Note\n\n**Title:** ${title || '(untitled)'}\n\n**Content:**\n${content}`;
-		const out = await this.chat(system, user, 128, 0.4, signal);
-		const tags = parseTagArray(out)
-			.map(normalizeTag)
-			.filter((t) => t.length > 0);
-		// de-dupe preserving order, cap at 5
-		const seen = new Set<string>();
-		const unique: string[] = [];
-		for (const t of tags) {
-			const key = t.toLowerCase();
-			if (!seen.has(key)) {
-				seen.add(key);
-				unique.push(t);
-			}
-			if (unique.length >= 5) break;
-		}
-		return unique;
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Session state
-// ---------------------------------------------------------------------------
-
-type SessionStatus =
-	| 'idle'
-	| 'recording'
-	| 'recorded'
-	| 'transcribing'
-	| 'summarizing'
-	| 'ready'
-	| 'saving'
-	| 'error';
-
-type ReviewTab = 'summary' | 'transcript' | 'memo';
-
-interface AudioSegment {
-	id: string;
-	audioData: ArrayBuffer | null; // present until the clip is saved to the vault
-	audioMime: string;
-	audioName: string;
-	audioSourcePath: string | null; // vault path once saved, or the original import source
-	transcript: string; // this segment's own transcribed text
-}
-
-interface MeetingSession {
-	status: SessionStatus;
-	segments: AudioSegment[];
-	transcript: string; // combined view of every segment's transcript, editable by hand
-	memo: string;
-	participants: string[];
-	contextFiles: string[];
-	diarize: boolean; // per-recording speaker identification (defaults from settings)
-	summary: string;
-	title: string;
-	tags: string[];
-	startedAt: number | null;
-	elapsedMs: number;
-	error: string | null;
-	activeTab: ReviewTab;
-	previewSummary: boolean;
-	progressLabel: string;
-	progressPct: number;
-	savedNotePath: string | null;
-	liveNotePath: string | null; // note created at quick-start time; merged into the final note on save
-	foreignNote: boolean; // true when bound to a note we didn't create — only ever merge into a marked block, never replace its content
-}
-
-function newSession(diarizeDefault = false): MeetingSession {
-	return {
-		status: 'idle',
-		segments: [],
-		transcript: '',
-		memo: '',
-		participants: [],
-		contextFiles: [],
-		diarize: diarizeDefault,
-		summary: '',
-		title: '',
-		tags: [],
-		startedAt: null,
-		elapsedMs: 0,
-		error: null,
-		activeTab: 'summary',
-		previewSummary: false,
-		progressLabel: '',
-		progressPct: 0,
-		savedNotePath: null,
-		liveNotePath: null,
-		foreignNote: false,
-	};
-}
-
-// ---------------------------------------------------------------------------
-// Fuzzy pickers
-// ---------------------------------------------------------------------------
-
-class FileSuggestModal extends FuzzySuggestModal<TFile> {
-	constructor(
-		app: App,
-		private files: TFile[],
-		private onPick: (file: TFile) => void,
-		placeholder: string
-	) {
-		super(app);
-		this.setPlaceholder(placeholder);
-	}
-	getItems(): TFile[] {
-		return this.files;
-	}
-	getItemText(file: TFile): string {
-		return file.path;
-	}
-	onChooseItem(file: TFile): void {
-		this.onPick(file);
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Sidebar view
-// ---------------------------------------------------------------------------
-
-const VIEW_TYPE_SCUTTLEBUTT = 'scuttlebutt-view';
-const AUDIO_EXTENSIONS = ['webm', 'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'mp4', 'mpga', 'oga'];
-
-/**
- * MediaRecorder-produced webm doesn't store its own duration, so Chromium reports
- * Infinity/NaN until you seek — the transport shows "0:00" with no total time as a
- * result. Seeking far past the end forces the browser to compute the real duration,
- * then we reset the playhead to the start. Standard, widely-used workaround. Used both
- * for the sidebar's own players and (via a markdown post-processor) for the audio
- * embeds Obsidian renders inside the note itself.
- */
-function fixMissingAudioDuration(player: HTMLAudioElement): void {
-	const check = () => {
-		if (player.duration !== Infinity && !Number.isNaN(player.duration)) return;
-		player.currentTime = 1e101;
-		const onTimeUpdate = () => {
-			player.removeEventListener('timeupdate', onTimeUpdate);
-			player.currentTime = 0;
-		};
-		player.addEventListener('timeupdate', onTimeUpdate);
-	};
-	if (player.readyState >= 1) check();
-	else player.addEventListener('loadedmetadata', check, { once: true });
-}
-
-class ScuttlebuttView extends ItemView {
-	private timer: number | null = null;
-	private timerEl: HTMLElement | null = null;
-	private audioUrls: Map<string, string> = new Map();
-
-	constructor(leaf: WorkspaceLeaf, private plugin: ScuttlebuttPlugin) {
-		super(leaf);
-	}
-
-	getViewType(): string {
-		return VIEW_TYPE_SCUTTLEBUTT;
-	}
-	getDisplayText(): string {
-		return 'Scuttlebutt';
-	}
-	getIcon(): string {
-		return 'mic';
-	}
-
-	async onOpen(): Promise<void> {
-		this.render();
-	}
-
-	async onClose(): Promise<void> {
-		this.stopTimer();
-		this.revokeAudioUrls();
-		this.contentEl.empty();
-	}
-
-	private revokeAudioUrls(): void {
-		for (const url of this.audioUrls.values()) URL.revokeObjectURL(url);
-		this.audioUrls.clear();
-	}
-
-	private get s(): MeetingSession {
-		return this.plugin.session;
-	}
-
-	updateTimer(): void {
-		if (this.timerEl && this.s.startedAt) {
-			this.timerEl.setText(formatDuration(Date.now() - this.s.startedAt));
-		}
-	}
-
-	private startTimer(): void {
-		if (this.timer !== null) return;
-		this.timer = window.setInterval(() => this.updateTimer(), 1000);
-		this.registerInterval(this.timer);
-	}
-
-	private stopTimer(): void {
-		if (this.timer !== null) {
-			window.clearInterval(this.timer);
-			this.timer = null;
-		}
-	}
-
-	// ---- rendering -------------------------------------------------------
-
-	render(): void {
-		this.stopTimer();
-		this.revokeAudioUrls();
-		this.timerEl = null;
-		const root = this.contentEl;
-		root.empty();
-		root.addClass('mh-root');
-
-		this.renderHeader(root);
-		this.renderCapture(root);
-
-		const s = this.s;
-		const hasContent = !!(s.segments.length || s.transcript || s.summary);
-		if (hasContent || s.status !== 'idle') {
-			this.renderMeta(root);
-			this.renderContext(root);
-			this.renderReview(root);
-			this.renderActions(root);
-		} else {
-			this.renderEmpty(root);
-		}
-
-		this.renderProgress(root);
-
-		if (s.status === 'recording') this.startTimer();
-	}
-
-	private renderHeader(root: HTMLElement): void {
-		const header = root.createDiv('mh-header');
-		const brand = header.createDiv('mh-brand');
-		setIcon(brand.createSpan('mh-brand-icon'), 'mic');
-		brand.createSpan({ text: 'Scuttlebutt', cls: 'mh-brand-title' });
-
-		const pill = header.createDiv({ cls: ['mh-pill', `mh-pill-${this.statusTone()}`] });
-		pill.createSpan('mh-pill-dot');
-		pill.createSpan({ text: this.statusLabel() });
-	}
-
-	private statusTone(): string {
-		switch (this.s.status) {
-			case 'recording':
-				return 'rec';
-			case 'transcribing':
-			case 'summarizing':
-			case 'saving':
-				return 'busy';
-			case 'ready':
-				return 'ok';
-			case 'error':
-				return 'err';
-			default:
-				return 'idle';
-		}
-	}
-
-	private statusLabel(): string {
-		switch (this.s.status) {
-			case 'recording':
-				return 'Recording';
-			case 'recorded':
-				return 'Recorded';
-			case 'transcribing':
-				return 'Transcribing';
-			case 'summarizing':
-				return 'Summarizing';
-			case 'ready':
-				return 'Ready';
-			case 'saving':
-				return 'Saving';
-			case 'error':
-				return 'Error';
-			default:
-				return 'Idle';
-		}
-	}
-
-	private renderCapture(root: HTMLElement): void {
-		const s = this.s;
-		const card = root.createDiv('mh-capture');
-		const recording = s.status === 'recording';
-		const busy = s.status === 'transcribing' || s.status === 'summarizing' || s.status === 'saving';
-
-		if (recording) {
-			// The ribbon icon already turns red while recording — this stays a quiet
-			// status line, not a second big indicator.
-			const status = card.createDiv('mh-recording-status');
-			setIcon(status.createSpan('mh-recording-dot'), 'circle');
-			this.timerEl = status.createSpan({ cls: 'mh-timer', text: formatDuration(s.elapsedMs) });
-			status.createSpan({ text: 'Recording…', cls: 'mh-recording-label' });
-			const stopBtn = status.createEl('button', { cls: 'mh-mini-btn', text: 'Stop' });
-			stopBtn.onclick = () => this.plugin.toggleRecording();
-		} else if (s.segments.length > 0) {
-			// A meeting is already loaded/underway — offer to extend it, not restart it.
-			// While transcribing/summarizing, this cancels that job instead of waiting for it.
-			const addBtn = card.createEl('button', { cls: 'mh-record-btn' });
-			setIcon(addBtn.createSpan('mh-record-icon'), 'plus');
-			addBtn.createSpan({ text: 'Add recording', cls: 'mh-record-label' });
-			addBtn.disabled = s.status === 'saving';
-			addBtn.setAttr(
-				'title',
-				s.status === 'transcribing' || s.status === 'summarizing'
-					? 'Cancel this and record another take instead'
-					: 'Record another take into this same meeting — e.g. after a break.'
-			);
-			addBtn.onclick = () => this.plugin.addRecording();
-		} else {
-			const recordBtn = card.createEl('button', { cls: 'mh-record-btn' });
-			setIcon(recordBtn.createSpan('mh-record-icon'), 'mic');
-			recordBtn.createSpan({ text: 'Start recording', cls: 'mh-record-label' });
-			recordBtn.disabled = busy;
-			recordBtn.onclick = () => this.plugin.toggleRecording();
-		}
-
-		const importRow = card.createDiv('mh-import-row');
-		const vaultBtn = importRow.createEl('button', { cls: 'mh-ghost-btn' });
-		setIcon(vaultBtn.createSpan('mh-ghost-icon'), 'folder-open');
-		vaultBtn.createSpan({ text: 'From vault' });
-		vaultBtn.disabled = recording || busy;
-		vaultBtn.onclick = () => this.pickAudioFromVault();
-
-		const diskBtn = importRow.createEl('button', { cls: 'mh-ghost-btn' });
-		setIcon(diskBtn.createSpan('mh-ghost-icon'), 'upload');
-		diskBtn.createSpan({ text: 'Upload' });
-		diskBtn.disabled = recording || busy;
-		diskBtn.onclick = () => this.uploadAudioFromDisk();
-
-		// A dedicated way to "Scuttlebutt-ify" a note that already has one or more audio
-		// embeds but wasn't created by this plugin — picks up every embed automatically,
-		// no need to select each file individually via "From vault". Only shown when the
-		// active note actually has embedded audio, per the file-open-maintained cache.
-		console.debug('[Scuttlebutt] renderCapture: segments=', s.segments.length, 'recording=', recording, 'activeNoteAudioFiles=', this.plugin.activeNoteAudioFiles.length);
-		if (s.segments.length === 0 && !recording && this.plugin.activeNoteAudioFiles.length > 0) {
-			const noteRow = card.createDiv('mh-import-row');
-			const noteBtn = noteRow.createEl('button', { cls: 'mh-ghost-btn' });
-			setIcon(noteBtn.createSpan('mh-ghost-icon'), 'file-audio-2');
-			const count = this.plugin.activeNoteAudioFiles.length;
-			noteBtn.createSpan({ text: count > 1 ? `This note's audio (${count})` : "This note's audio" });
-			noteBtn.disabled = busy;
-			noteBtn.setAttr(
-				'title',
-				'Transcribe & summarize every audio embed already in this note, writing the result back into it.'
-			);
-			noteBtn.onclick = () => this.plugin.scuttlebuttifyActiveNote();
-		}
-
-		// Per-recording speaker identification, seeded from the global default. Flipping
-		// this after a transcript exists takes effect on the next (Re-)transcribe.
-		const diarRow = card.createDiv('mh-diar-row');
-		const diarToggle = diarRow.createEl('label', { cls: 'mh-diar' });
-		const diarCb = diarToggle.createEl('input', { attr: { type: 'checkbox' } });
-		diarCb.checked = s.diarize;
-		diarCb.disabled = recording || busy;
-		setIcon(diarToggle.createSpan('mh-diar-icon'), 'users');
-		diarToggle.createSpan({ text: 'Identify speakers' });
-		diarCb.onchange = () => {
-			s.diarize = diarCb.checked;
-		};
-
-		if (s.segments.length > 0 && !recording) {
-			const list = card.createDiv('mh-segments');
-			for (const seg of s.segments) {
-				const row = list.createDiv('mh-segment');
-				const info = row.createDiv('mh-segment-info');
-				setIcon(info.createSpan('mh-clip-icon'), 'audio-file');
-				info.createSpan({ text: seg.audioName, cls: 'mh-clip-name' });
-
-				const del = row.createEl('button', { cls: 'mh-mini-btn mh-segment-delete' });
-				setIcon(del.createSpan(), 'trash-2');
-				del.setAttr('title', 'Delete this recording');
-				del.disabled = busy;
-				del.onclick = () => this.plugin.deleteSegment(seg.id);
-
-				const player = row.createEl('audio', { cls: 'mh-audio', attr: { controls: 'true' } });
-				if (seg.audioSourcePath) {
-					const file = this.app.vault.getAbstractFileByPath(seg.audioSourcePath);
-					if (file instanceof TFile) player.src = this.app.vault.getResourcePath(file);
-				} else if (seg.audioData) {
-					const url = URL.createObjectURL(new Blob([seg.audioData], { type: seg.audioMime }));
-					this.audioUrls.set(seg.id, url);
-					player.src = url;
-				}
-				fixMissingAudioDuration(player);
-			}
-		}
-	}
-
-	private renderEmpty(root: HTMLElement): void {
-		const empty = root.createDiv('mh-empty');
-		setIcon(empty.createDiv('mh-empty-icon'), 'sparkles');
-		empty.createEl('p', {
-			cls: 'mh-empty-text',
-			text: 'Record a meeting or import an audio clip. Add any notes as context, and a summary is written for you.',
-		});
-	}
-
-	/**
-	 * Insert a tag/participant chip just before `before` (the text input). Adding a
-	 * chip this way avoids a full re-render, so the input keeps focus and the user can
-	 * keep typing the next entry instead of the cursor jumping away.
-	 */
-	private insertChip(wrap: HTMLElement, before: HTMLElement, text: string, onRemove: () => void): void {
-		const chip = createSpan('mh-tag');
-		wrap.insertBefore(chip, before);
-		chip.createSpan({ text });
-		const remove = chip.createSpan({ cls: 'mh-tag-x', text: '×' });
-		remove.onclick = onRemove;
-	}
-
-	private renderMeta(root: HTMLElement): void {
-		const s = this.s;
-		const meta = root.createDiv('mh-meta');
-
-		const titleField = meta.createDiv('mh-field');
-		titleField.createEl('label', { text: 'Title', cls: 'mh-label' });
-		const titleInput = titleField.createEl('input', {
-			cls: 'mh-input',
-			attr: { type: 'text', placeholder: 'Untitled meeting' },
-		});
-		titleInput.value = s.title;
-		titleInput.oninput = () => (s.title = titleInput.value);
-
-		const partField = meta.createDiv('mh-field');
-		partField.createEl('label', { text: 'Participants', cls: 'mh-label' });
-		const partWrap = partField.createDiv('mh-tags');
-		for (const person of s.participants) {
-			const chip = partWrap.createSpan('mh-tag');
-			chip.createSpan({ text: person });
-			const remove = chip.createSpan({ cls: 'mh-tag-x', text: '×' });
-			remove.onclick = () => {
-				s.participants = s.participants.filter((p) => p !== person);
-				this.render();
-			};
-		}
-		const addPart = partWrap.createEl('input', {
-			cls: 'mh-tag-input',
-			attr: { type: 'text', placeholder: '+ name' },
-		});
-		addPart.onkeydown = (e: KeyboardEvent) => {
-			if (e.key !== 'Enter') return;
-			e.preventDefault();
-			const name = addPart.value.trim();
-			if (name && !s.participants.some((p) => p.toLowerCase() === name.toLowerCase())) {
-				s.participants.push(name);
-				this.insertChip(partWrap, addPart, name, () => {
-					s.participants = s.participants.filter((p) => p !== name);
-					this.render();
-				});
-			}
-			addPart.value = '';
-		};
-
-		const tagsField = meta.createDiv('mh-field');
-		tagsField.createEl('label', { text: 'Tags', cls: 'mh-label' });
-		const tagsWrap = tagsField.createDiv('mh-tags');
-		for (const tag of s.tags) {
-			const chip = tagsWrap.createSpan('mh-tag');
-			chip.createSpan({ text: '#' + tag });
-			const remove = chip.createSpan({ cls: 'mh-tag-x', text: '×' });
-			remove.onclick = () => {
-				s.tags = s.tags.filter((t) => t !== tag);
-				this.render();
-			};
-		}
-		const addTag = tagsWrap.createEl('input', {
-			cls: 'mh-tag-input',
-			attr: { type: 'text', placeholder: '+ tag' },
-		});
-		addTag.onkeydown = (e: KeyboardEvent) => {
-			if (e.key !== 'Enter') return;
-			e.preventDefault();
-			const t = normalizeTag(addTag.value);
-			if (t && !s.tags.some((x) => x.toLowerCase() === t.toLowerCase())) {
-				s.tags.push(t);
-				this.insertChip(tagsWrap, addTag, '#' + t, () => {
-					s.tags = s.tags.filter((x) => x !== t);
-					this.render();
-				});
-			}
-			addTag.value = '';
-		};
-	}
-
-	private renderContext(root: HTMLElement): void {
-		const s = this.s;
-		const section = root.createDiv('mh-context');
-		const head = section.createDiv('mh-section-head');
-		head.createSpan({ text: 'Context files', cls: 'mh-section-title' });
-		const add = head.createEl('button', { cls: 'mh-mini-btn' });
-		setIcon(add.createSpan(), 'plus');
-		add.createSpan({ text: 'Add' });
-		add.onclick = () => this.pickContextFile();
-
-		if (s.contextFiles.length === 0) {
-			section.createDiv({ cls: 'mh-hint', text: 'Add notes (agenda, prior meetings) to steer the summary.' });
-		} else {
-			const list = section.createDiv('mh-chip-list');
-			for (const path of s.contextFiles) {
-				const chip = list.createDiv('mh-chip');
-				setIcon(chip.createSpan('mh-chip-icon'), 'file-text');
-				chip.createSpan({ text: path.split('/').pop() ?? path, cls: 'mh-chip-name', attr: { title: path } });
-				const x = chip.createSpan({ cls: 'mh-chip-x', text: '×' });
-				x.onclick = () => {
-					s.contextFiles = s.contextFiles.filter((p) => p !== path);
-					this.render();
-				};
-			}
-		}
-	}
-
-	private renderReview(root: HTMLElement): void {
-		const s = this.s;
-		const section = root.createDiv('mh-review');
-
-		const tabs = section.createDiv('mh-tabs');
-		const tabDef: { id: ReviewTab; label: string }[] = [
-			{ id: 'summary', label: 'Summary' },
-			{ id: 'transcript', label: 'Transcript' },
-			{ id: 'memo', label: 'Memo' },
-		];
-		for (const t of tabDef) {
-			const btn = tabs.createEl('button', {
-				cls: ['mh-tab', s.activeTab === t.id ? 'is-active' : ''],
-				text: t.label,
-			});
-			btn.onclick = () => {
-				s.activeTab = t.id;
-				this.render();
-			};
-		}
-
-		const body = section.createDiv('mh-review-body');
-		if (s.activeTab === 'summary') this.renderSummaryTab(body);
-		else if (s.activeTab === 'transcript') this.renderTranscriptTab(body);
-		else this.renderMemoTab(body);
-	}
-
-	private renderSummaryTab(body: HTMLElement): void {
-		const s = this.s;
-		const bar = body.createDiv('mh-tab-bar');
-		const regen = bar.createEl('button', { cls: 'mh-mini-btn' });
-		setIcon(regen.createSpan(), 'refresh-cw');
-		regen.createSpan({ text: s.summary ? 'Regenerate' : 'Summarize' });
-		regen.disabled = !s.transcript || s.status === 'summarizing' || s.status === 'transcribing';
-		regen.onclick = () => this.plugin.regenerateSummary();
-
-		if (s.summary) {
-			const toggle = bar.createEl('button', { cls: 'mh-mini-btn' });
-			setIcon(toggle.createSpan(), s.previewSummary ? 'pencil' : 'eye');
-			toggle.createSpan({ text: s.previewSummary ? 'Edit' : 'Preview' });
-			toggle.onclick = () => {
-				s.previewSummary = !s.previewSummary;
-				this.render();
-			};
-		}
-
-		if (s.previewSummary && s.summary) {
-			const preview = body.createDiv('mh-markdown');
-			MarkdownRenderer.render(this.app, s.summary, preview, '', this as Component);
-		} else {
-			const area = body.createEl('textarea', {
-				cls: 'mh-textarea',
-				attr: { placeholder: 'The summary will appear here after transcription.' },
-			});
-			area.value = s.summary;
-			area.oninput = () => (s.summary = area.value);
-		}
-	}
-
-	private renderTranscriptTab(body: HTMLElement): void {
-		const s = this.s;
-		const bar = body.createDiv('mh-tab-bar');
-		const retry = bar.createEl('button', { cls: 'mh-mini-btn' });
-		setIcon(retry.createSpan(), 'refresh-cw');
-		retry.createSpan({ text: 'Re-transcribe' });
-		retry.disabled = !s.segments.length || s.status === 'transcribing' || s.status === 'summarizing';
-		retry.setAttr('title', s.segments.length ? 'Transcribe every recording again' : 'No audio available to re-transcribe');
-		retry.onclick = () => this.plugin.retranscribe();
-
-		const area = body.createEl('textarea', {
-			cls: 'mh-textarea',
-			attr: { placeholder: 'Transcript will appear here.' },
-		});
-		area.value = s.transcript;
-		area.oninput = () => (s.transcript = area.value);
-	}
-
-	private renderMemoTab(body: HTMLElement): void {
-		const s = this.s;
-		body.createDiv({ cls: 'mh-hint', text: 'Your own notes. Used as context for the summary.' });
-		const area = body.createEl('textarea', {
-			cls: 'mh-textarea',
-			attr: { placeholder: 'Jot down agenda items or notes…' },
-		});
-		area.value = s.memo;
-		area.oninput = () => (s.memo = area.value);
-	}
-
-	private renderActions(root: HTMLElement): void {
-		const s = this.s;
-		const actions = root.createDiv('mh-actions');
-
-		const save = actions.createEl('button', { cls: 'mh-primary-btn' });
-		setIcon(save.createSpan(), 'save');
-		save.createSpan({ text: s.savedNotePath ? 'Saved ✓  Save again' : 'Save note' });
-		save.disabled = !s.summary && !s.transcript;
-		save.onclick = () => this.plugin.saveNote();
-
-		const reset = actions.createEl('button', { cls: 'mh-ghost-btn mh-reset' });
-		setIcon(reset.createSpan(), 'rotate-ccw');
-		reset.createSpan({ text: 'New' });
-		reset.disabled = s.status === 'recording';
-		reset.onclick = () => this.plugin.resetSession();
-
-		if (s.savedNotePath) {
-			const open = actions.createEl('button', { cls: 'mh-ghost-btn' });
-			setIcon(open.createSpan(), 'external-link');
-			open.createSpan({ text: 'Open' });
-			open.onclick = () => this.app.workspace.openLinkText(s.savedNotePath!, '', false);
-		}
-	}
-
-	private renderProgress(root: HTMLElement): void {
-		const s = this.s;
-		if (!s.progressLabel && !s.error) return;
-		const wrap = root.createDiv('mh-progress');
-		if (s.error) {
-			const err = wrap.createDiv('mh-error');
-			setIcon(err.createSpan('mh-error-icon'), 'alert-triangle');
-			err.createSpan({ text: s.error });
-		} else {
-			const track = wrap.createDiv('mh-bar-track');
-			const fill = track.createDiv('mh-bar-fill');
-			fill.style.width = Math.max(4, Math.min(100, s.progressPct)) + '%';
-			if (s.progressPct < 100) fill.addClass('is-animated');
-			const row = wrap.createDiv('mh-progress-row');
-			row.createDiv({ cls: 'mh-progress-label', text: s.progressLabel });
-			if (s.status === 'transcribing' || s.status === 'summarizing') {
-				const cancel = row.createEl('button', { cls: 'mh-cancel-btn', text: 'Cancel' });
-				cancel.onclick = () => this.plugin.cancelActive();
-			}
-		}
-	}
-
-	// ---- input handlers --------------------------------------------------
-
-	private pickAudioFromVault(): void {
-		const files = this.app.vault
-			.getFiles()
-			.filter((f) => AUDIO_EXTENSIONS.includes(f.extension.toLowerCase()));
-		if (files.length === 0) {
-			new Notice('No audio files found in this vault.');
-			return;
-		}
-		new FileSuggestModal(this.app, files, (file) => this.plugin.importFromVault(file), 'Pick an audio clip…').open();
-	}
-
-	private uploadAudioFromDisk(): void {
-		const input = createEl('input', { attr: { type: 'file', accept: 'audio/*' } });
-		input.onchange = async () => {
-			const file = input.files?.[0];
-			if (file) await this.plugin.importFromDisk(file);
-		};
-		input.click();
-	}
-
-	private pickContextFile(): void {
-		const chosen = new Set(this.s.contextFiles);
-		const files = this.app.vault.getMarkdownFiles().filter((f) => !chosen.has(f.path));
-		if (files.length === 0) {
-			new Notice('No more markdown files to add.');
-			return;
-		}
-		new FileSuggestModal(
-			this.app,
-			files,
-			(file) => {
-				this.s.contextFiles.push(file.path);
-				this.render();
-			},
-			'Add a context note…'
-		).open();
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
+import {
+	AudioSegment,
+	DEFAULT_DATE_FORMAT,
+	DEFAULT_FILENAME_TEMPLATE,
+	DEFAULT_SETTINGS,
+	MeetingSession,
+	mmt,
+	newSession,
+	ScuttlebuttSettings,
+	SessionStatus,
+	VIEW_TYPE_SCUTTLEBUTT,
+} from './types';
+import { MeetingRecorder } from './recorder';
+import { AIService } from './ai';
+import { ScuttlebuttView } from './view';
+import { ScuttlebuttSettingTab } from './settings-tab';
+
+// API keys live in Obsidian's secret storage (OS keychain), not data.json.
+const STT_KEY_ID = 'scuttlebutt-stt-api-key';
+const LLM_KEY_ID = 'scuttlebutt-llm-api-key';
 
 export default class ScuttlebuttPlugin extends Plugin {
 	declare settings: ScuttlebuttSettings;
 	session: MeetingSession = newSession();
 	recorder = new MeetingRecorder();
 	ai!: AIService;
-	private ribbonIconEl: HTMLElement | null = null;
+	private statusBarEl: HTMLElement | null = null;
+	private statusBarTimer: number | null = null;
+	// In-flight transcription/summary request, so the user can cancel it. Each run owns
+	// its own AbortController; catch handlers classify a user abort via controller.signal.aborted.
+	private activeController: AbortController | null = null;
+	private startingRecording = false;
+	// Guards against stop() running twice concurrently: a device can expose more than one
+	// audio track (e.g. stereo captured as two mono tracks), each with its own 'ended'
+	// listener (see recorder.ts) — a real disconnect can fire more than one of those at
+	// once, each independently calling stopRecording(). Without this, the second call
+	// would race the first: recorder.stop() resolves with an empty blob once the recorder
+	// has already been torn down, showing a spurious "Recording was empty" right after a
+	// perfectly good segment was just captured.
+	private stoppingRecording = false;
 	// Audio files embedded in the current non-Scuttlebutt active note, if any — kept in
 	// sync via the file-open handler below, so renderCapture() can show the "This note's
 	// audio" button without doing an async file read on every render.
 	activeNoteAudioFiles: TFile[] = [];
-	private statusBarEl: HTMLElement | null = null;
-	private statusBarTimer: number | null = null;
-	// In-flight transcription/summary request, so the user can cancel it. `cancelled`
-	// distinguishes a user abort from a genuine failure in the catch handlers.
-	private activeController: AbortController | null = null;
-	private cancelled = false;
+	// Cleared if secret storage is unavailable, so we fall back to keeping the keys
+	// in data.json rather than losing them.
+	private secretStorageOk = true;
+
+	/** True while a transcription, summary, or save is running. */
+	isBusy(): boolean {
+		const st = this.session.status;
+		return st === 'transcribing' || st === 'summarizing' || st === 'saving';
+	}
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		// The initial session was field-initialised before settings loaded — seed its run
+		// options from the settings now so the first recording reflects the configured defaults.
+		this.session.diarize = this.settings.sttDiarize;
+		this.session.reasoningEffort = this.settings.reasoningEffort;
+		this.session.stream = this.settings.streamSummary;
 
 		this.registerView(VIEW_TYPE_SCUTTLEBUTT, (leaf) => new ScuttlebuttView(leaf, this));
-		this.ribbonIconEl = this.addRibbonIcon('mic', 'Scuttlebutt', () => this.toggleRecording());
+		this.addRibbonIcon('mic', 'Scuttlebutt', () => this.ribbonClicked());
 
 		this.recorder.onUnexpectedEnd = (trackLabel) => {
 			new Notice(
-				`Mikrofonverbindung während der Aufnahme unterbrochen (${trackLabel}). ` +
-					'Der Rest dieser Aufnahme ist leer — bitte "Stop" drücken und danach "Add recording" erneut versuchen.',
+				`Mic connection dropped during recording (${trackLabel}). ` +
+					'The rest of this recording is empty — press Stop and try "Add recording" again.',
 				12000
 			);
-			this.stopRecording();
+			void this.stopRecording();
 		};
-
-		// Same duration-metadata fix as the sidebar's own players, applied to the audio
-		// embeds Obsidian renders inside the note itself.
-		// Reading View and Live Preview render `![[...]]` audio embeds through entirely
-		// different internal paths — a markdown post-processor only covers Reading View.
-		// A single long-lived observer on the whole workspace catches <audio> elements
-		// regardless of which view (or future view) put them there.
-		const audioObserver = new MutationObserver((mutations) => {
-			for (const mutation of mutations) {
-				for (const node of mutation.addedNodes) {
-					if (!(node instanceof HTMLElement)) continue;
-					if (node.tagName === 'AUDIO') fixMissingAudioDuration(node as HTMLAudioElement);
-					node.querySelectorAll?.('audio').forEach((el) => fixMissingAudioDuration(el as HTMLAudioElement));
-				}
-			}
-		});
-		audioObserver.observe(document.body, { childList: true, subtree: true });
-		this.register(() => audioObserver.disconnect());
 
 		this.addCommand({ id: 'open-sidebar', name: 'Open sidebar', callback: () => this.activateView() });
 		this.addCommand({
+			id: 'link-active-note',
+			name: 'Link current note to Scuttlebutt',
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const can = !!file && file.extension === 'md' && !this.recorder.isActive() && !this.isBusy();
+				if (can && !checking) void this.linkActiveNote();
+				return can;
+			},
+		});
+		this.addCommand({
 			id: 'toggle-recording',
 			name: 'Start / stop recording',
-			callback: () => this.toggleRecording(),
+			callback: () => this.ribbonClicked(),
+		});
+		this.addCommand({
+			id: 'toggle-pause',
+			name: 'Pause / resume recording',
+			checkCallback: (checking) => {
+				const can = this.recorder.isActive();
+				if (can && !checking) this.togglePause();
+				return can;
+			},
 		});
 		this.addCommand({
 			id: 'process-recording',
 			name: 'Transcribe & summarize current recording',
 			checkCallback: (checking) => {
-				const can = this.session.segments.length > 0 && this.session.status !== 'transcribing';
-				if (can && !checking) this.retranscribe();
+				const can = this.session.segments.length > 0 && !this.isBusy();
+				if (can && !checking) void this.runPipeline();
 				return can;
 			},
 		});
@@ -1438,13 +144,35 @@ export default class ScuttlebuttPlugin extends Plugin {
 			id: 'save-note',
 			name: 'Save meeting note',
 			checkCallback: (checking) => {
-				const can = !!(this.session.summary || this.session.transcript);
-				if (can && !checking) this.saveNote();
+				const can = !!(this.session.summary || this.session.transcript) && !this.isBusy();
+				if (can && !checking) void this.saveNote();
 				return can;
 			},
 		});
 
 		this.addSettingTab(new ScuttlebuttSettingTab(this.app, this));
+
+		this.statusBarEl = this.addStatusBarItem();
+		this.statusBarEl.addClass('mh-statusbar', 'mh-hidden');
+
+		// Check for a newer release once the workspace is ready (non-blocking, throttled).
+		this.app.workspace.onLayoutReady(() => void this.maybeCheckForUpdate());
+
+		// Reading View and Live Preview render `![[...]]` audio embeds through entirely
+		// different internal paths — a markdown post-processor only covers Reading View.
+		// A single long-lived observer on the whole workspace catches <audio> elements
+		// regardless of which view (or future view) put them there.
+		const audioObserver = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				mutation.addedNodes.forEach((node) => {
+					if (!(node instanceof HTMLElement)) return;
+					if (node.tagName === 'AUDIO') fixMissingAudioDuration(node as HTMLAudioElement);
+					node.querySelectorAll?.('audio').forEach((el) => fixMissingAudioDuration(el));
+				});
+			}
+		});
+		audioObserver.observe(document.body, { childList: true, subtree: true });
+		this.register(() => audioObserver.disconnect());
 
 		// file-open only fires on navigation — if a note was already active before the
 		// plugin (re)loaded, it never fires for that note at all. Check once explicitly,
@@ -1453,13 +181,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 		// switch away and back.
 		this.app.workspace.onLayoutReady(async () => {
 			const initialFile = this.app.workspace.getActiveFile();
-			console.debug('[Scuttlebutt] onLayoutReady, initialFile =', initialFile?.path);
 			if (!initialFile) return;
 			if (this.isScuttlebuttNote(initialFile)) {
 				await this.loadNoteIntoSession(initialFile);
 			} else {
 				this.activeNoteAudioFiles = await this.findEmbeddedAudioFiles(initialFile);
-				console.debug('[Scuttlebutt] onLayoutReady found audio embeds:', this.activeNoteAudioFiles.map((f) => f.path));
 				this.refreshViews();
 			}
 		});
@@ -1468,28 +194,23 @@ export default class ScuttlebuttPlugin extends Plugin {
 		// as a properties panel for whichever such note is active — no separate command.
 		this.registerEvent(
 			this.app.workspace.on('file-open', async (file) => {
-				console.debug('[Scuttlebutt] file-open:', file?.path, 'isScuttlebuttNote =', file ? this.isScuttlebuttNote(file) : null);
-				if (this.recorder.isRecording() || !file) return;
-				if (file.path === this.session.savedNotePath || file.path === this.session.liveNotePath) return;
+				if (this.recorder.isActive() || this.isBusy() || !file) return;
+				if (file.path === this.session.savedNotePath) return;
 				if (this.isScuttlebuttNote(file)) {
-					this.loadNoteIntoSession(file);
+					await this.loadNoteIntoSession(file);
 					this.activeNoteAudioFiles = [];
 				} else {
 					if (this.session.savedNotePath) {
-						// Navigated away from a finished (already-saved) meeting to an unrelated
-						// note — clear the stale session instead of leaving old data on display.
+						// Navigated away from a finished (already-saved) meeting to an
+						// unrelated note — clear the stale session instead of leaving old
+						// data on display.
 						this.resetSession();
 					}
 					this.activeNoteAudioFiles = await this.findEmbeddedAudioFiles(file);
-					console.debug('[Scuttlebutt] file-open found audio embeds:', this.activeNoteAudioFiles.map((f) => f.path));
 					this.refreshViews();
 				}
 			})
 		);
-
-		this.statusBarEl = this.addStatusBarItem();
-		this.statusBarEl.addClass('mh-statusbar');
-		this.statusBarEl.style.display = 'none';
 	}
 
 	onunload(): void {
@@ -1498,21 +219,126 @@ export default class ScuttlebuttPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = (await this.loadData()) as Partial<ScuttlebuttSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+		// reasoningBudgets is a nested object: clone the defaults and merge any saved
+		// values so editing it never mutates DEFAULT_SETTINGS, and older data (missing
+		// some levels) still gets every level filled in.
+		this.settings.reasoningBudgets = Object.assign(
+			{},
+			DEFAULT_REASONING_BUDGETS,
+			saved?.reasoningBudgets
+		);
+		// API keys live in secret storage. Load them into the in-memory settings (which
+		// AIService reads), migrating any plaintext key left in data.json by older versions.
+		let migrated = false;
+		const loadKey = (id: string, plaintext: string): string => {
+			try {
+				const secret = this.app.secretStorage.getSecret(id);
+				if (secret !== null) return secret;
+				if (plaintext) {
+					this.app.secretStorage.setSecret(id, plaintext);
+					migrated = true;
+				}
+				return plaintext;
+			} catch {
+				this.secretStorageOk = false;
+				return plaintext;
+			}
+		};
+		this.settings.sttApiKey = loadKey(STT_KEY_ID, this.settings.sttApiKey);
+		this.settings.llmApiKey = loadKey(LLM_KEY_ID, this.settings.llmApiKey);
 		this.ai = new AIService(this.settings);
+		// Re-save once after a migration so the plaintext key is scrubbed from data.json.
+		if (migrated && this.secretStorageOk) await this.saveSettings();
 	}
 
 	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
-		this.ai = new AIService(this.settings);
-		this.refreshViews();
+		// Persist only. AIService holds `settings` by reference (mutated in place), so it needs
+		// no rebuild; and the sidebar reads session state, not settings, so no re-render is
+		// needed here. Re-rendering per keystroke rebuilt the audio Blob and reset playback.
+		// API keys are blanked before persisting so they never touch data.json (unless secret
+		// storage is unavailable, in which case we keep them to avoid data loss).
+		const data: ScuttlebuttSettings = this.secretStorageOk
+			? { ...this.settings, sttApiKey: '', llmApiKey: '' }
+			: this.settings;
+		await this.saveData(data);
+	}
+
+	/** Store an API key in secret storage and mirror it into the in-memory settings. */
+	setApiKey(which: 'stt' | 'llm', value: string): void {
+		const id = which === 'stt' ? STT_KEY_ID : LLM_KEY_ID;
+		if (which === 'stt') this.settings.sttApiKey = value;
+		else this.settings.llmApiKey = value;
+		try {
+			this.app.secretStorage.setSecret(id, value);
+		} catch {
+			this.secretStorageOk = false;
+		}
+	}
+
+	/**
+	 * Ask GitHub for the latest release at most once a day, remember it, and — if it
+	 * is newer than the installed version — show a one-time notice. Silent on failure;
+	 * a missed check should never nag. Skipped entirely when the user opts out.
+	 */
+	async maybeCheckForUpdate(): Promise<void> {
+		const s = this.settings;
+		if (!s.updateCheckEnabled) return;
+		const DAY_MS = 24 * 60 * 60 * 1000;
+		if (Date.now() - s.lastUpdateCheck >= DAY_MS) {
+			s.lastUpdateCheck = Date.now();
+			await this.saveSettings();
+			try {
+				const res = await requestUrl({
+					url: 'https://api.github.com/repos/qkm2000/Scuttlebutt/releases/latest',
+					headers: { Accept: 'application/vnd.github+json' },
+					throw: false,
+				});
+				const data: unknown = res.json;
+				if (isRecord(data)) {
+					const tag = str(data.tag_name).replace(/^v/i, '').trim();
+					if (tag) {
+						s.latestKnownVersion = tag;
+						await this.saveSettings();
+					}
+				}
+			} catch {
+				// network or parse failure — stay quiet
+			}
+		}
+		this.notifyIfUpdate();
+	}
+
+	/** Show an update notice with a jump-to-update action, if a newer version is known. */
+	private notifyIfUpdate(): void {
+		const latest = this.settings.latestKnownVersion;
+		if (!latest || !isNewerVersion(latest, this.manifest.version)) return;
+		const frag = createFragment((f) => {
+			f.appendText(`Scuttlebutt ${latest} is available (you have ${this.manifest.version}). `);
+			const link = f.createEl('a', { text: 'Update', href: '#' });
+			link.addEventListener('click', (e) => {
+				e.preventDefault();
+				this.openCommunityPlugins();
+			});
+		});
+		new Notice(frag, 15000);
+	}
+
+	/** Open Settings -> Community plugins so the user can update from there. */
+	openCommunityPlugins(): void {
+		const setting = (
+			this.app as unknown as { setting?: { open(): void; openTabById(id: string): void } }
+		).setting;
+		setting?.open();
+		setting?.openTabById('community-plugins');
 	}
 
 	async activateView(): Promise<void> {
 		try {
 			const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_SCUTTLEBUTT);
 			if (existing.length > 0) {
-				this.app.workspace.revealLeaf(existing[0]);
+				await this.app.workspace.revealLeaf(existing[0]);
 				return;
 			}
 			const leaf = this.app.workspace.getRightLeaf(false);
@@ -1521,10 +347,10 @@ export default class ScuttlebuttPlugin extends Plugin {
 				return;
 			}
 			await leaf.setViewState({ type: VIEW_TYPE_SCUTTLEBUTT, active: true });
-			this.app.workspace.revealLeaf(leaf);
+			await this.app.workspace.revealLeaf(leaf);
 		} catch (err) {
 			console.error('Scuttlebutt: failed to open sidebar', err);
-			new Notice('Failed to open sidebar: ' + (err as Error).message);
+			new Notice('Failed to open sidebar: ' + errorMessage(err));
 		}
 	}
 
@@ -1539,9 +365,64 @@ export default class ScuttlebuttPlugin extends Plugin {
 		for (const view of this.getViews()) view.render();
 	}
 
+	/**
+	 * A new empty session that inherits the current session's run options (speakers /
+	 * thinking / streaming). Used when a recording or import begins, so choices made after
+	 * "New" persist into the run instead of being reset to the global defaults.
+	 */
+	private freshSession(): MeetingSession {
+		const s = this.session;
+		const next = newSession(s.diarize, s.reasoningEffort, s.stream);
+		// An explicit "From note" binding (see linkActiveNote) is a standing choice for
+		// this meeting — it survives into the next recording/import, not just the first
+		// one, until the user starts a genuinely new, unbound meeting or links elsewhere.
+		// But a binding that only exists because an old note was passively opened for
+		// viewing (loadedFromNote) is not that choice — it shouldn't carry forward either.
+		if (s.foreignNote && s.savedNotePath && !s.loadedFromNote) {
+			next.foreignNote = true;
+			next.savedNotePath = s.savedNotePath;
+		}
+		return next;
+	}
+
+	/**
+	 * Bind the currently active note as this session's save target before any audio
+	 * exists yet — e.g. a handwritten note you're about to also record for. Whatever you
+	 * record, or import via "From vault"/"Upload", afterward merges into that note
+	 * through the same marked-block mechanism as "This note's audio", leaving the rest of
+	 * what you wrote untouched.
+	 */
+	async linkActiveNote(): Promise<void> {
+		if (this.recorder.isActive() || this.isBusy()) return;
+		const file = this.app.workspace.getActiveFile();
+		if (!file || file.extension !== 'md') {
+			new Notice('Open the note you want to link first.');
+			return;
+		}
+		if (this.isScuttlebuttNote(file)) {
+			new Notice('This is already a Scuttlebutt note — just record or add audio normally.');
+			return;
+		}
+		if (
+			(this.session.summary || this.session.transcript || this.session.segments.length > 0) &&
+			!this.session.loadedFromNote
+		) {
+			new Notice('Finish or clear the current meeting first ("New").');
+			return;
+		}
+		this.session.savedNotePath = file.path;
+		this.session.foreignNote = true;
+		this.refreshViews();
+		new Notice('Linked to: ' + file.basename);
+	}
+
+	/** Push streaming summary/reasoning into open views in place (no full re-render). */
+	private updateStreamingViews(): void {
+		for (const view of this.getViews()) view.updateStreaming();
+	}
+
 	private setStatus(status: SessionStatus): void {
 		this.session.status = status;
-		this.ribbonIconEl?.toggleClass('scuttlebutt-ribbon-recording', status === 'recording');
 	}
 
 	private setProgress(label: string, pct: number): void {
@@ -1559,36 +440,117 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	/** Create an empty note and open it in the main pane for the user's own live minutes. */
-	private async createLiveNote(): Promise<void> {
-		try {
-			await this.ensureFolder(this.settings.notesFolder);
-			const base = `Recording ${recordingStamp(new Date(this.session.startedAt ?? Date.now()))}`;
-			const path = await this.uniquePath(this.settings.notesFolder, base, 'md');
-			const file = await this.app.vault.create(path, '');
-			this.session.liveNotePath = file.path;
-			await this.app.workspace.getLeaf(false).openFile(file);
-		} catch (err: any) {
-			// Recording still runs fine without a live note; just tell the user why typing has nowhere to go.
-			new Notice('Could not create the live note: ' + (err?.message ?? err));
+	/**
+	 * Ribbon icon / "toggle-recording" command: one click should always do something
+	 * useful — start a fresh recording, add a take to an already-reviewed meeting, or
+	 * stop whichever of those is running. Never just open the sidebar with no action,
+	 * since that's already reachable without the ribbon icon at all.
+	 */
+	async ribbonClicked(): Promise<void> {
+		if (this.recorder.isActive()) {
+			await this.stopRecording();
+		} else if ((this.session.summary || this.session.transcript) && !this.session.loadedFromNote) {
+			await this.addRecording();
+		} else {
+			await this.startRecording();
 		}
 	}
 
-	/** Current on-disk content of the live note, or '' if there isn't one. */
-	private async readLiveNoteContent(): Promise<string> {
-		if (!this.session.liveNotePath) return '';
-		const file = this.app.vault.getAbstractFileByPath(this.session.liveNotePath);
-		return file instanceof TFile ? await this.app.vault.read(file) : '';
-	}
-
-	/** Request mic (+ optional system audio) capture. Shows its own Notices on failure/partial success. */
-	private async requestCapture(): Promise<{ ok: boolean; systemAudio: boolean }> {
+	async startRecording(): Promise<void> {
+		// Synchronous guard: a second call (double-click, ribbon + command) before the first
+		// resolves would start a concurrent recorder and orphan the first mic stream.
+		if (this.recorder.isActive() || this.startingRecording) return;
+		this.startingRecording = true;
 		try {
-			const result = await this.recorder.start({
+		if (this.session.status !== 'idle' && this.session.status !== 'error') {
+			// Fresh recording starts a fresh session unless there is unsaved review content.
+			// A note that was merely opened for viewing (loadedFromNote) is already fully
+			// saved — nothing is at risk, so let a fresh recording proceed over it.
+			if ((this.session.summary || this.session.transcript) && !this.session.loadedFromNote) {
+				new Notice('Finish or clear the current meeting first ("New"), or use "Add recording" to extend it.');
+				await this.activateView();
+				return;
+			}
+		}
+		let result: { systemAudio: boolean };
+		try {
+			result = await this.recorder.start({
 				inputDeviceId: this.settings.inputDeviceId,
 				systemAudioDeviceId: this.settings.systemAudioDeviceId,
 				captureSystemAudio: this.settings.captureSystemAudio,
 			});
+		} catch (err) {
+			new Notice('Microphone access failed: ' + errorMessage(err));
+			return;
+		}
+		if ((this.settings.systemAudioDeviceId || this.settings.captureSystemAudio) && !result.systemAudio) {
+			new Notice(
+				'System audio could not be captured — recording microphone only. ' +
+					'On macOS, install a loopback device (e.g. BlackHole) and pick it as the ' +
+					'System audio device in Settings → Capture.',
+				8000
+			);
+		}
+		this.session = this.freshSession();
+		this.session.activeMs = 0;
+		this.session.segmentStartedAt = Date.now();
+		this.session.paused = false;
+		this.setStatus('recording');
+		this.startStatusBarTimer();
+		await this.activateView();
+		this.refreshViews();
+		if (!this.session.foreignNote) {
+			// Create the note file right away, before any audio exists — so it shows up in
+			// the vault immediately, and the recording is added into this same note once it
+			// finishes, rather than the note only coming into being once you stop.
+			try {
+				this.session.savedNotePath = await this.writeNote();
+				if (this.settings.autoOpenNote) {
+					// New leaf, not the active one — so whatever you already had open (e.g. a
+					// note you were reading) isn't replaced out from under you; matches the
+					// same auto-open behavior used elsewhere (syncNote).
+					await this.revealOrOpenNote(this.session.savedNotePath);
+				}
+			} catch (err) {
+				console.warn('Scuttlebutt: could not pre-create the note', err);
+			}
+		}
+		} finally {
+			this.startingRecording = false;
+		}
+	}
+
+	/**
+	 * Record another take into the current meeting (e.g. after a break, or once it's
+	 * already been transcribed/summarized/saved) without discarding what's there.
+	 * Distinct from togglePause(), which only covers a brief pause *within* one take.
+	 */
+	async addRecording(): Promise<void> {
+		if (this.recorder.isActive() || this.startingRecording) return;
+		this.startingRecording = true;
+		try {
+			// Accidentally hit "Stop"? Don't force a wait for the transcript/summary of
+			// that clip to finish — cancel it and go straight into the next recording
+			// instead. But whatever's already done (e.g. the transcript, even if the
+			// *summary* didn't finish) must be saved first — deterministically, before
+			// touching the mic again, not left to race against finishCancelled().
+			if (this.isBusy()) {
+				this.cancelActive();
+				if (this.session.transcript.trim() || this.session.summary.trim()) {
+					await this.syncNote();
+				}
+			}
+			let result: { systemAudio: boolean };
+			try {
+				result = await this.recorder.start({
+					inputDeviceId: this.settings.inputDeviceId,
+					systemAudioDeviceId: this.settings.systemAudioDeviceId,
+					captureSystemAudio: this.settings.captureSystemAudio,
+				});
+			} catch (err) {
+				new Notice('Microphone access failed: ' + errorMessage(err));
+				return;
+			}
 			if ((this.settings.systemAudioDeviceId || this.settings.captureSystemAudio) && !result.systemAudio) {
 				new Notice(
 					'System audio could not be captured — recording microphone only. ' +
@@ -1597,80 +559,38 @@ export default class ScuttlebuttPlugin extends Plugin {
 					8000
 				);
 			}
-			return { ok: true, systemAudio: result.systemAudio };
-		} catch (err: any) {
-			// A start was already in flight (e.g. a double-click) — nothing went wrong,
-			// just quietly ignore the redundant second call instead of alarming the user.
-			if (err?.message === MeetingRecorder.ALREADY_STARTING) {
-				return { ok: false, systemAudio: false };
-			}
-			new Notice('Microphone access failed: ' + (err?.message ?? err));
-			return { ok: false, systemAudio: false };
+			this.session.activeMs = 0;
+			this.session.segmentStartedAt = Date.now();
+			this.session.paused = false;
+			this.setStatus('recording');
+			this.startStatusBarTimer();
+			await this.activateView();
+			this.refreshViews();
+		} finally {
+			this.startingRecording = false;
 		}
-	}
-
-	async startRecording(): Promise<void> {
-		// A saved session is finished business — clear it automatically so every
-		// entry point (ribbon icon, sidebar button, command palette) is always
-		// ready to go, instead of blocking on the "unsaved work" guard below.
-		if (this.session.savedNotePath) {
-			this.resetSession();
-		}
-		if (this.session.status !== 'idle' && this.session.status !== 'error') {
-			// Fresh recording starts a fresh session unless there is unsaved review content.
-			if (this.session.summary || this.session.transcript) {
-				new Notice('Finish or clear the current meeting first ("New"), or use "Add recording" to extend it.');
-				await this.activateView();
-				return;
-			}
-		}
-		const cap = await this.requestCapture();
-		if (!cap.ok) return;
-		this.session = newSession(this.settings.sttDiarize);
-		this.session.startedAt = Date.now();
-		this.setStatus('recording');
-		this.startStatusBarTimer();
-		await this.activateView();
-		this.refreshViews();
-		await this.createLiveNote();
-	}
-
-	/** Record another take into the current meeting (e.g. after a break) without discarding what's there. */
-	async addRecording(): Promise<void> {
-		if (this.recorder.isRecording()) return;
-		// Accidentally hit "Stop"? Don't force a wait for the transcript/summary of that
-		// clip to finish — cancel it and go straight into the next recording instead.
-		// But whatever's already done (e.g. the transcript, even if the *summary* didn't
-		// finish) must be saved first — deterministically, before touching the mic again,
-		// not left to race against finishCancelled()'s own async cleanup.
-		if (this.session.status === 'transcribing' || this.session.status === 'summarizing') {
-			this.cancelActive();
-			if (this.session.transcript.trim() || this.session.summary.trim()) {
-				await this.syncNote();
-			}
-		}
-		const cap = await this.requestCapture();
-		if (!cap.ok) return;
-		this.session.startedAt = Date.now();
-		console.debug('[Scuttlebutt] addRecording(): session.startedAt set to', this.session.startedAt);
-		this.setStatus('recording');
-		this.startStatusBarTimer();
-		await this.activateView();
-		this.refreshViews();
 	}
 
 	async stopRecording(): Promise<void> {
-		if (!this.recorder.isRecording()) return;
+		if (!this.recorder.isActive() || this.stoppingRecording) return;
+		this.stoppingRecording = true;
+		try {
 		// MediaRecorder only delivers its first chunk after ~1s; stopping before that
-		// always yields an empty clip. Rather than let that read as a mysterious bug,
-		// just wait out the remainder before actually stopping.
-		const elapsedSoFar = this.session.startedAt ? Date.now() - this.session.startedAt : 0;
-		console.debug('[Scuttlebutt] main.stopRecording(): session.startedAt =', this.session.startedAt, 'elapsedSoFar =', elapsedSoFar, 'ms');
+		// always yields an empty clip. Wait out the remainder rather than let that read
+		// as a mysterious bug.
+		const elapsedSoFar =
+			this.session.activeMs + (this.session.segmentStartedAt ? Date.now() - this.session.segmentStartedAt : 0);
 		const MIN_RECORDING_MS = 1200;
 		if (elapsedSoFar < MIN_RECORDING_MS) {
 			await new Promise((r) => window.setTimeout(r, MIN_RECORDING_MS - elapsedSoFar));
 		}
-		this.session.elapsedMs = this.session.startedAt ? Date.now() - this.session.startedAt : 0;
+		const now = Date.now();
+		if (this.session.segmentStartedAt !== null) {
+			this.session.activeMs += now - this.session.segmentStartedAt;
+			this.session.segmentStartedAt = null;
+		}
+		this.session.paused = false;
+		this.session.elapsedMs = this.session.activeMs;
 		const blob = await this.recorder.stop();
 		this.stopStatusBarTimer();
 		if (blob.size === 0) {
@@ -1679,12 +599,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.refreshViews();
 			return;
 		}
-		const startedAt = this.session.startedAt ?? Date.now();
 		const segment: AudioSegment = {
-			id: `${recordingStamp(new Date(startedAt))}-${Math.random().toString(36).slice(2, 6)}`,
+			id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
 			audioData: await blob.arrayBuffer(),
 			audioMime: this.recorder.getMimeType(),
-			audioName: `Recording ${recordingStamp(new Date(startedAt))}.webm`,
+			audioName: `recording ${todayStamp(new Date())} ${formatDuration(this.session.elapsedMs)}.webm`,
 			audioSourcePath: null,
 			transcript: '',
 		};
@@ -1696,45 +615,28 @@ export default class ScuttlebuttPlugin extends Plugin {
 		// lose the recording itself, only (at worst) having to redo transcription.
 		await this.syncNote();
 		new Notice('Recording saved. Transcribing…');
-		this.runPipeline(segment);
+		void this.runPipeline();
+		} finally {
+			this.stoppingRecording = false;
+		}
 	}
 
-	/** Delete one recording (and its transcript) from the current meeting. */
-	async deleteSegment(id: string): Promise<void> {
-		const s = this.session;
-		const idx = s.segments.findIndex((seg) => seg.id === id);
-		if (idx === -1) return;
-		const [removed] = s.segments.splice(idx, 1);
-		if (removed.audioSourcePath) {
-			const file = this.app.vault.getAbstractFileByPath(removed.audioSourcePath);
-			if (file instanceof TFile) {
-				try {
-					await this.app.vault.trash(file, true);
-				} catch (err) {
-					console.warn('Scuttlebutt: could not delete audio file', err);
-				}
-			}
-		}
-		this.recomputeTranscript();
-		this.refreshViews();
-		if (s.segments.length === 0) {
-			this.setStatus('idle');
-			this.refreshViews();
-			return;
-		}
-		if (this.settings.autoSummarize && this.settings.llmEndpoint && this.settings.llmModel && s.transcript.trim()) {
-			await this.summarizeInternal();
+	togglePause(): void {
+		if (!this.recorder.isActive()) return;
+		const now = Date.now();
+		if (this.session.paused) {
+			this.recorder.resume();
+			this.session.segmentStartedAt = now;
+			this.session.paused = false;
 		} else {
-			await this.syncNote();
+			this.recorder.pause();
+			if (this.session.segmentStartedAt !== null) {
+				this.session.activeMs += now - this.session.segmentStartedAt;
+				this.session.segmentStartedAt = null;
+			}
+			this.session.paused = true;
 		}
-	}
-
-	/** Recompute the combined transcript from every segment's own text. */
-	private recomputeTranscript(): void {
-		this.session.transcript = this.session.segments
-			.map((seg) => seg.transcript.trim())
-			.filter(Boolean)
-			.join('\n\n---\n\n');
+		this.refreshViews();
 	}
 
 	// ---- import ----------------------------------------------------------
@@ -1749,11 +651,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 			const boundNotePath = await this.findNoteEmbedding(file);
 
 			const data = await this.app.vault.readBinary(file);
-			this.session = newSession(this.settings.sttDiarize);
+			this.session = this.freshSession();
 			this.session.savedNotePath = boundNotePath;
 			this.session.foreignNote = !!boundNotePath;
 			const segment: AudioSegment = {
-				id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
+				id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 				audioData: data,
 				audioMime: this.mimeForExtension(file.extension),
 				audioName: file.name,
@@ -1763,93 +665,19 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.session.segments.push(segment);
 			this.setStatus('recorded');
 			this.refreshViews();
-			if (boundNotePath) {
-				new Notice('Vorhandene Notiz erkannt — Ergebnis wird dort eingefügt: ' + boundNotePath);
-			}
-			this.runPipeline(segment);
-		} catch (err: any) {
-			new Notice('Could not read audio file: ' + (err?.message ?? err));
-		}
-	}
-
-	/** Path of the active note, if it already embeds this exact audio file — else null. */
-	/** All audio files this note embeds, resolved to real vault files (missing links are skipped). */
-	private async findEmbeddedAudioFiles(note: TFile): Promise<TFile[]> {
-		if (note.extension !== 'md') return [];
-		const content = await this.app.vault.cachedRead(note);
-		const links = extractAudioEmbeds(content);
-		console.debug('[Scuttlebutt] findEmbeddedAudioFiles: raw embed links in', note.path, '=', links);
-		const files: TFile[] = [];
-		for (const link of links) {
-			const resolved = this.app.metadataCache.getFirstLinkpathDest(link, note.path);
-			console.debug('[Scuttlebutt]   resolve', JSON.stringify(link), '->', resolved?.path ?? 'NOT FOUND');
-			if (resolved) files.push(resolved);
-		}
-		return files;
-	}
-
-	private async findNoteEmbedding(audioFile: TFile): Promise<string | null> {
-		const active = this.app.workspace.getActiveFile();
-		if (!active) return null;
-		const embedded = await this.findEmbeddedAudioFiles(active);
-		return embedded.some((f) => f.path === audioFile.path) ? active.path : null;
-	}
-
-	/** "This note's audio": transcribe + summarize every audio file the active note already
-	 * embeds, merging the result into a marked block instead of touching anything else
-	 * the user wrote in that note. */
-	async scuttlebuttifyActiveNote(): Promise<void> {
-		if (this.recorder.isRecording()) return;
-		const file = this.app.workspace.getActiveFile();
-		if (!file || this.activeNoteAudioFiles.length === 0) {
-			new Notice('No audio embedded in the current note.');
-			return;
-		}
-		this.session = newSession(this.settings.sttDiarize);
-		this.session.savedNotePath = file.path;
-		this.session.foreignNote = true;
-
-		for (const audioFile of this.activeNoteAudioFiles) {
-			try {
-				const data = await this.app.vault.readBinary(audioFile);
-				this.session.segments.push({
-					id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
-					audioData: data,
-					audioMime: this.mimeForExtension(audioFile.extension),
-					audioName: audioFile.name,
-					audioSourcePath: audioFile.path,
-					transcript: '',
-				});
-			} catch (err: any) {
-				new Notice('Could not read ' + audioFile.name + ': ' + (err?.message ?? err));
-			}
-		}
-		if (this.session.segments.length === 0) return;
-
-		this.setStatus('recorded');
-		this.refreshViews();
-		new Notice(`Transcribing ${this.session.segments.length} recording(s) from this note…`);
-
-		for (const segment of this.session.segments) {
-			const ok = await this.transcribeStep(segment);
-			if (!ok) return;
-		}
-		if (this.settings.autoSummarize && this.settings.llmEndpoint && this.settings.llmModel) {
-			await this.summarizeInternal();
-		} else {
-			this.setStatus('recorded');
-			this.session.activeTab = 'transcript';
-			this.refreshViews();
-			await this.syncNote();
+			if (boundNotePath) new Notice('Existing note detected — result will be added to: ' + boundNotePath);
+			void this.runPipeline();
+		} catch (err) {
+			new Notice('Could not read audio file: ' + errorMessage(err));
 		}
 	}
 
 	async importFromDisk(file: File): Promise<void> {
 		try {
 			const data = await file.arrayBuffer();
-			this.session = newSession(this.settings.sttDiarize);
+			this.session = this.freshSession();
 			const segment: AudioSegment = {
-				id: `${recordingStamp(new Date())}-${Math.random().toString(36).slice(2, 6)}`,
+				id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 				audioData: data,
 				audioMime: file.type || this.mimeForExtension(file.name.split('.').pop() ?? ''),
 				audioName: file.name,
@@ -1860,9 +688,45 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.setStatus('recorded');
 			await this.activateView();
 			this.refreshViews();
-			this.runPipeline(segment);
-		} catch (err: any) {
-			new Notice('Could not read audio file: ' + (err?.message ?? err));
+			void this.runPipeline();
+		} catch (err) {
+			new Notice('Could not read audio file: ' + errorMessage(err));
+		}
+	}
+
+	/**
+	 * macOS-only: load or unload another local LaunchAgent-managed service by its label,
+	 * via `launchctl`. Used to free up its GPU memory around a batch of LLM calls when
+	 * running both at once would otherwise exceed the machine's unified-memory ceiling
+	 * (see unloadServiceBeforeLLM in Settings). Failures are logged, never thrown — a
+	 * service already in the target state, or a launchctl quirk, shouldn't block
+	 * transcription or summarization.
+	 *
+	 * Node/Electron APIs don't exist on mobile and merely referencing them can crash the
+	 * plugin there — so the Platform check must happen, and return, before either
+	 * require() call below is ever reached, not just before the setting is honored.
+	 */
+	private async toggleLaunchAgent(action: 'load' | 'unload', label: string): Promise<void> {
+		if (!Platform.isDesktop) return;
+		const trimmedLabel = label.trim();
+		if (!trimmedLabel) return;
+		// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- lazy desktop-only Node import, reached only after the Platform check above
+		const { execFile } = require('child_process') as typeof import('child_process');
+		// eslint-disable-next-line @typescript-eslint/no-require-imports, no-undef -- lazy desktop-only Node import, reached only after the Platform check above
+		const { homedir } = require('os') as typeof import('os');
+		const plistPath = `${homedir()}/Library/LaunchAgents/${trimmedLabel}.plist`;
+		await new Promise<void>((resolve) => {
+			execFile('launchctl', [action, plistPath], (err, _stdout, stderr) => {
+				if (err) {
+					console.warn(`Scuttlebutt: launchctl ${action} failed for "${trimmedLabel}"`, stderr || err.message);
+				}
+				resolve();
+			});
+		});
+		if (action === 'unload') {
+			// Give macOS a moment to actually reclaim the freed Metal memory before the
+			// next request tries to allocate against it.
+			await new Promise((r) => window.setTimeout(r, 1500));
 		}
 	}
 
@@ -1882,10 +746,146 @@ export default class ScuttlebuttPlugin extends Plugin {
 		return map[ext.toLowerCase()] ?? 'application/octet-stream';
 	}
 
+	/** All audio files this note embeds, resolved to real vault files (missing links are skipped). */
+	private async findEmbeddedAudioFiles(note: TFile): Promise<TFile[]> {
+		if (note.extension !== 'md') return [];
+		const content = await this.app.vault.cachedRead(note);
+		const files: TFile[] = [];
+		for (const link of extractAudioEmbeds(content)) {
+			const resolved = this.app.metadataCache.getFirstLinkpathDest(link, note.path);
+			if (resolved) files.push(resolved);
+		}
+		return files;
+	}
+
+	private async findNoteEmbedding(audioFile: TFile): Promise<string | null> {
+		const active = this.app.workspace.getActiveFile();
+		if (!active) return null;
+		const embedded = await this.findEmbeddedAudioFiles(active);
+		return embedded.some((f) => f.path === audioFile.path) ? active.path : null;
+	}
+
+	/** True for a note bearing our own `scuttlebutt: true` frontmatter flag. */
+	private isScuttlebuttNote(file: TFile): boolean {
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+		return fm?.scuttlebutt === true;
+	}
+
+	/** Load an already-saved Scuttlebutt note back into the session, so the sidebar acts
+	 * as a live properties panel for whichever such note is currently open. */
+	private async loadNoteIntoSession(file: TFile): Promise<void> {
+		const content = await this.app.vault.read(file);
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+		const fmEnd = content.indexOf('\n---', 3);
+		const fullBody = fmEnd === -1 ? content : content.slice(fmEnd + 4).trim();
+
+		// A note we merged into (rather than created) keeps its own content around our
+		// marked block — only parse summary/transcript/memo from inside that block, but
+		// still scan the whole file for audio embeds, since those live wherever the user
+		// originally put them.
+		const markerRe = /<!--scuttlebutt:start-->\n([\s\S]*?)\n<!--scuttlebutt:end-->/;
+		const markerMatch = fullBody.match(markerRe);
+		const isForeign = !!markerMatch;
+		const body = markerMatch ? markerMatch[1] : fullBody;
+
+		const s = newSession(this.settings.sttDiarize, this.settings.reasoningEffort, this.settings.streamSummary);
+		s.foreignNote = isForeign;
+		s.title = file.basename.replace(/^\d{4}-\d{2}-\d{2}[ -]+/, '');
+		s.tags = Array.isArray(fm.tags) ? fm.tags.map(String) : [];
+		s.participants = Array.isArray(fm.participants) ? fm.participants.map(String) : [];
+
+		for (const link of extractAudioEmbeds(fullBody)) {
+			const target = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
+			s.segments.push({
+				id: target?.path ?? link,
+				audioData: null,
+				audioMime: target ? this.mimeForExtension(target.extension) : 'audio/webm',
+				audioName: target?.name ?? link,
+				audioSourcePath: target?.path ?? link,
+				transcript: '',
+			});
+		}
+
+		const transcript = extractCallout(body, 'note', 'Transcript') ?? '';
+		if (s.segments.length > 0) {
+			// The combined transcript is segments joined by "\n\n---\n\n" (see
+			// transcribeStep) — split back along that same separator so each segment
+			// keeps its own text where possible.
+			const chunks = transcript.split(/\n\n---\n\n/);
+			if (chunks.length === s.segments.length) {
+				s.segments.forEach((seg, i) => (seg.transcript = chunks[i]));
+			} else if (s.segments.length > 0) {
+				s.segments[s.segments.length - 1].transcript = transcript;
+			}
+		}
+		s.transcript = transcript;
+
+		const memo = extractCallout(body, 'quote', 'Memo');
+		if (memo) s.memo = memo;
+		s.summary = extractSummaryBody(body);
+
+		s.savedNotePath = file.path;
+		s.status = s.summary ? 'ready' : s.segments.length > 0 ? 'recorded' : 'idle';
+		s.loadedFromNote = true;
+		this.session = s;
+		this.refreshViews();
+	}
+
+	/** "This note's audio": transcribe + summarize every audio file the active note already
+	 * embeds, merging the result into a marked block instead of touching anything else
+	 * the user wrote in that note. */
+	async scuttlebuttifyActiveNote(): Promise<void> {
+		if (this.recorder.isActive()) return;
+		const file = this.app.workspace.getActiveFile();
+		if (!file || this.activeNoteAudioFiles.length === 0) {
+			new Notice('No audio embedded in the current note.');
+			return;
+		}
+		this.session = newSession(this.settings.sttDiarize, this.settings.reasoningEffort, this.settings.streamSummary);
+		this.session.savedNotePath = file.path;
+		this.session.foreignNote = true;
+
+		for (const audioFile of this.activeNoteAudioFiles) {
+			this.session.segments.push({
+				id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+				audioData: null,
+				audioMime: this.mimeForExtension(audioFile.extension),
+				audioName: audioFile.name,
+				audioSourcePath: audioFile.path,
+				transcript: '',
+			});
+		}
+
+		this.setStatus('recorded');
+		this.refreshViews();
+		new Notice(`Transcribing ${this.session.segments.length} recording(s) from this note…`);
+		void this.runAllSegmentsThenSummarize();
+	}
+
+	/** Transcribe every not-yet-transcribed segment in order, then summarize once at the end. */
+	private async runAllSegmentsThenSummarize(): Promise<void> {
+		while (this.session.segments.some((seg) => !seg.transcript.trim())) {
+			const ok = await this.transcribeStep();
+			if (!ok) return;
+		}
+		if (this.settings.autoSummarize && this.settings.llmEndpoint && this.settings.llmModel) {
+			await this.summarizeInternal();
+		} else {
+			this.setStatus('recorded');
+			this.session.activeTab = 'transcript';
+			this.refreshViews();
+			await this.syncNote();
+		}
+	}
+
 	// ---- pipeline --------------------------------------------------------
 
-	async runPipeline(segment: AudioSegment): Promise<void> {
-		const ok = await this.transcribeStep(segment);
+	async runPipeline(): Promise<void> {
+		if (this.isBusy()) {
+			new Notice('A transcription or summary is already running.');
+			return;
+		}
+		const ok = await this.transcribeStep();
 		if (!ok) return;
 
 		// Summarize (+ title + tags), if enabled and configured.
@@ -1902,16 +902,21 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	/** Re-run transcription on every recording, leaving any existing summary in place. */
+	/** Re-run transcription on the most recent take, leaving any existing summary in place. */
 	async retranscribe(): Promise<void> {
 		if (this.session.segments.length === 0) {
 			new Notice('No audio to transcribe.');
 			return;
 		}
-		for (const segment of this.session.segments) {
-			const ok = await this.transcribeStep(segment);
-			if (!ok) return;
+		if (this.isBusy()) {
+			new Notice('A transcription or summary is already running.');
+			return;
 		}
+		// A manual retry always means "redo the last take", even if it already has a
+		// transcript — transcribeStep() otherwise prefers an untranscribed segment.
+		this.session.segments[this.session.segments.length - 1].transcript = '';
+		const ok = await this.transcribeStep();
+		if (!ok) return;
 		this.setStatus(this.session.summary ? 'ready' : 'recorded');
 		this.setProgress('Transcript updated.', 100);
 		this.session.activeTab = 'transcript';
@@ -1920,71 +925,104 @@ export default class ScuttlebuttPlugin extends Plugin {
 		window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 	}
 
-	/** Load a segment's audio from the vault if we only have a path for it (e.g. a note loaded from disk). */
-	private async ensureSegmentAudioData(segment: AudioSegment): Promise<boolean> {
-		if (segment.audioData) return true;
-		if (!segment.audioSourcePath) return false;
+	/** Read a segment's audio bytes, loading them from the vault if not already in memory. */
+	private async getSegmentAudioData(segment: AudioSegment): Promise<ArrayBuffer | null> {
+		if (segment.audioData) return segment.audioData;
+		if (!segment.audioSourcePath) return null;
 		const file = this.app.vault.getAbstractFileByPath(segment.audioSourcePath);
-		if (!(file instanceof TFile)) return false;
+		if (!(file instanceof TFile)) return null;
 		try {
-			segment.audioData = await this.app.vault.readBinary(file);
-			return true;
+			return await this.app.vault.readBinary(file);
 		} catch {
-			return false;
+			return null;
 		}
 	}
 
-	/** Transcribe one segment's audio. Returns false (and sets error state) on failure. */
-	private async transcribeStep(segment: AudioSegment): Promise<boolean> {
+	/** Transcribe whichever segment still needs it (or the newest one, for a manual retry). */
+	private async transcribeStep(): Promise<boolean> {
 		const s = this.session;
-		if (!(await this.ensureSegmentAudioData(segment))) {
+		if (s.segments.length === 0) {
 			new Notice('No audio to transcribe.');
+			return false;
+		}
+		const segment = s.segments.find((seg) => !seg.transcript.trim()) ?? s.segments[s.segments.length - 1];
+		const audioData = await this.getSegmentAudioData(segment);
+		if (!audioData) {
+			new Notice('Could not read audio for this take.');
 			return false;
 		}
 		s.error = null;
 		this.setStatus('transcribing');
 		this.setProgress('Transcribing audio…', 30);
 		this.refreshViews();
+		if (this.settings.unloadOllamaBeforeTranscribe) {
+			await this.toggleLaunchAgent('unload', this.settings.ollamaServiceLabel);
+		}
 		const name = segment.audioName || 'recording.webm';
 		const wantSpeakers = s.diarize;
-		this.cancelled = false;
-		const controller = new AbortController();
-		this.activeController = controller;
-		let result: { text: string; hasSpeakers: boolean };
-		let fellBack = false;
-		try {
+
+		// One attempt, with its own internal diarize→flat fallback. Reused for both the
+		// original try and the post-restart retry below, so both go through the same
+		// speaker-identification fallback rather than duplicating that logic.
+		const attempt = async (signal: AbortSignal): Promise<{ text: string; hasSpeakers: boolean; fellBack: boolean }> => {
 			try {
-				result = await this.ai.transcribe(segment.audioData!, name, segment.audioMime, wantSpeakers, controller.signal);
+				const r = await this.ai.transcribe(audioData, name, segment.audioMime, wantSpeakers, signal);
+				return { ...r, fellBack: false };
 			} catch (diarErr) {
-				// A cancel or a non-diarized failure is terminal; only a diarized attempt
-				// is worth retrying flat.
-				if (this.cancelled || !wantSpeakers) throw diarErr;
-				fellBack = true;
+				if (signal.aborted || !wantSpeakers) throw diarErr;
 				new Notice('Speaker identification failed — transcribing without speaker labels.');
 				this.setProgress('Retrying without speaker identification…', 30);
 				this.refreshViews();
-				result = await this.ai.transcribe(segment.audioData!, name, segment.audioMime, false, controller.signal);
+				const r = await this.ai.transcribe(audioData, name, segment.audioMime, false, signal);
+				return { ...r, fellBack: true };
 			}
-		} catch (err: any) {
-			if (this.cancelled) {
+		};
+
+		const controller = new AbortController();
+		this.activeController = controller;
+		let result: { text: string; hasSpeakers: boolean; fellBack: boolean };
+		try {
+			try {
+				result = await attempt(controller.signal);
+			} catch (err) {
+				if (controller.signal.aborted || !this.settings.restartWhisperOnTranscribeFailure) throw err;
+				// whisper.cpp's Metal backend can get stuck in an error state after a real
+				// out-of-memory failure, failing every request afterward regardless of size,
+				// until the process itself restarts — so try exactly that, once, rather than
+				// requiring a manual launchctl restart.
+				new Notice('Transcription failed — restarting the Whisper server and retrying once…', 6000);
+				await this.toggleLaunchAgent('unload', this.settings.unloadServiceLabel);
+				await this.toggleLaunchAgent('load', this.settings.unloadServiceLabel);
+				// Give the model time to actually reload before hammering it again — a large
+				// local model can take a while to come back up.
+				await new Promise((r) => window.setTimeout(r, 15000));
+				this.setProgress('Retrying transcription…', 30);
+				this.refreshViews();
+				result = await attempt(controller.signal);
+			}
+		} catch (err) {
+			if (controller.signal.aborted) {
 				this.finishCancelled();
 				return false;
 			}
-			s.error = err?.message ?? String(err);
+			s.error = errorMessage(err);
 			this.setStatus('error');
 			this.setProgress('', 0);
 			this.refreshViews();
 			new Notice('Transcription failed: ' + s.error);
 			return false;
 		} finally {
-			this.activeController = null;
+			if (this.activeController === controller) this.activeController = null;
+			if (this.settings.unloadOllamaBeforeTranscribe) {
+				await this.toggleLaunchAgent('load', this.settings.ollamaServiceLabel);
+			}
 		}
 		segment.transcript = result.text;
 		// Diarization was requested and the request *succeeded*, but the endpoint gave
 		// back no speaker labels — it silently ignored the request. Say so, so a flat
 		// transcript doesn't look like the feature is broken. (Skip if we already fell
 		// back above, which explained the flat result.)
-		if (wantSpeakers && !fellBack && !result.hasSpeakers) {
+		if (wantSpeakers && !result.fellBack && !result.hasSpeakers) {
 			new Notice('This endpoint returned no speaker labels — saved as a flat transcript. It may not support speaker identification.');
 		}
 		if (!segment.transcript.trim()) {
@@ -1994,7 +1032,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 			this.refreshViews();
 			return false;
 		}
-		this.recomputeTranscript();
+		// Recompute the combined transcript from every segment, in recording order.
+		s.transcript = s.segments
+			.map((seg) => seg.transcript)
+			.filter((t) => t.trim())
+			.join('\n\n---\n\n');
 		return true;
 	}
 
@@ -2003,12 +1045,69 @@ export default class ScuttlebuttPlugin extends Plugin {
 			new Notice('Nothing to summarize yet.');
 			return;
 		}
+		if (this.isBusy()) {
+			new Notice('A transcription or summary is already running.');
+			return;
+		}
 		await this.summarizeInternal();
+	}
+
+	/** Regenerate just the title (or just the tags) from the current summary/transcript. */
+	async regenerateTitle(): Promise<void> {
+		await this.regeneratePiece('title');
+	}
+
+	async regenerateTags(): Promise<void> {
+		await this.regeneratePiece('tags');
+	}
+
+	private async regeneratePiece(piece: 'title' | 'tags'): Promise<void> {
+		const s = this.session;
+		const basis = s.summary || s.transcript;
+		if (!basis.trim()) {
+			new Notice('Summarize or transcribe first.');
+			return;
+		}
+		if (s.status === 'summarizing' || s.status === 'transcribing') return;
+		if (this.settings.unloadServiceBeforeLLM) await this.toggleLaunchAgent('unload', this.settings.unloadServiceLabel);
+		const controller = new AbortController();
+		this.activeController = controller;
+		this.setStatus('summarizing');
+		this.setProgress(piece === 'title' ? 'Naming…' : 'Tagging…', 80);
+		this.refreshViews();
+		try {
+			if (piece === 'title') {
+				s.title = await this.ai.generateTitle(basis, controller.signal, s.reasoningEffort);
+				s.summary = structureSummary(s.summary, s.title.trim() || 'Summary');
+				await this.renameNoteToMatchTitle();
+			} else {
+				s.tags = await this.ai.generateTags(s.title, basis, this.getVaultTags(), controller.signal, s.reasoningEffort);
+			}
+			this.setStatus('ready');
+			this.setProgress(piece === 'title' ? 'Title updated.' : 'Tags updated.', 100);
+			this.refreshViews();
+			await this.syncNote();
+			window.setTimeout(() => this.clearProgressIfIdle(), 3000);
+		} catch (err) {
+			if (controller.signal.aborted) {
+				this.finishCancelled();
+				return;
+			}
+			this.setStatus(s.summary ? 'ready' : 'recorded');
+			this.setProgress('', 0);
+			this.refreshViews();
+			new Notice(`${piece === 'title' ? 'Title' : 'Tag'} generation failed: ${errorMessage(err)}`);
+		} finally {
+			if (this.activeController === controller) this.activeController = null;
+			if (this.settings.unloadServiceBeforeLLM) await this.toggleLaunchAgent('load', this.settings.unloadServiceLabel);
+		}
 	}
 
 	private async summarizeInternal(): Promise<void> {
 		const s = this.session;
 		s.error = null;
+		s.summary = '';
+		s.reasoning = '';
 		this.setStatus('summarizing');
 		this.setProgress('Summarizing…', 60);
 		s.activeTab = 'summary';
@@ -2016,26 +1115,39 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 		const contextDocs = await this.readContextDocs();
 
-		this.cancelled = false;
+		if (this.settings.unloadServiceBeforeLLM) await this.toggleLaunchAgent('unload', this.settings.unloadServiceLabel);
+
 		const controller = new AbortController();
 		this.activeController = controller;
 		try {
 			try {
-				s.summary = await this.ai.summarize(
+				const result = await this.ai.summarize(
 					{
 						transcript: s.transcript,
 						memo: s.memo,
 						participants: s.participants.join(', '),
 						contextDocs,
 					},
-					controller.signal
+					{
+						signal: controller.signal,
+						reasoning: s.reasoningEffort,
+						onDelta: s.stream
+							? (answer, reasoning) => {
+									s.summary = answer;
+									s.reasoning = reasoning;
+									this.updateStreamingViews();
+							  }
+							: undefined,
+					}
 				);
-			} catch (err: any) {
-				if (this.cancelled) {
+				s.summary = result.summary;
+				s.reasoning = result.reasoning;
+			} catch (err) {
+				if (controller.signal.aborted) {
 					this.finishCancelled();
 					return;
 				}
-				s.error = err?.message ?? String(err);
+				s.error = errorMessage(err);
 				this.setStatus('error');
 				this.setProgress('', 0);
 				this.refreshViews();
@@ -2051,9 +1163,10 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 			if (this.settings.generateTitle && !s.title.trim()) {
 				try {
-					s.title = await this.ai.generateTitle(basis, controller.signal);
+					s.title = await this.ai.generateTitle(basis, controller.signal, s.reasoningEffort);
+					await this.renameNoteToMatchTitle();
 				} catch (err) {
-					if (this.cancelled) {
+					if (controller.signal.aborted) {
 						this.finishCancelled();
 						return;
 					}
@@ -2062,9 +1175,9 @@ export default class ScuttlebuttPlugin extends Plugin {
 			}
 			if (this.settings.generateTags && s.tags.length === 0) {
 				try {
-					s.tags = await this.ai.generateTags(s.title, basis, this.getVaultTags(), controller.signal);
+					s.tags = await this.ai.generateTags(s.title, basis, this.getVaultTags(), controller.signal, s.reasoningEffort);
 				} catch (err) {
-					if (this.cancelled) {
+					if (controller.signal.aborted) {
 						this.finishCancelled();
 						return;
 					}
@@ -2077,12 +1190,15 @@ export default class ScuttlebuttPlugin extends Plugin {
 			s.summary = structureSummary(s.summary, s.title.trim() || 'Summary');
 
 			this.setStatus('ready');
-			this.setProgress('Summary ready. Review and save.', 100);
+			this.setProgress('Summary ready. Saving…', 95);
 			this.refreshViews();
 			await this.syncNote();
+			this.setProgress('Saved ✓', 100);
+			this.refreshViews();
 			window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 		} finally {
-			this.activeController = null;
+			if (this.activeController === controller) this.activeController = null;
+			if (this.settings.unloadServiceBeforeLLM) await this.toggleLaunchAgent('load', this.settings.unloadServiceLabel);
 		}
 	}
 
@@ -2096,7 +1212,6 @@ export default class ScuttlebuttPlugin extends Plugin {
 	/** Abort the in-flight transcription/summary request, if any. */
 	cancelActive(): void {
 		if (!this.activeController) return;
-		this.cancelled = true;
 		this.activeController.abort();
 		this.setProgress('Cancelling…', this.session.progressPct);
 		this.refreshViews();
@@ -2108,21 +1223,12 @@ export default class ScuttlebuttPlugin extends Plugin {
 		s.error = null;
 		// If "Add recording" already started a new take in the meantime, leave that
 		// status alone instead of clobbering it with the now-stale cancelled state.
-		const startingFresh = this.recorder.isRecording();
-		if (!startingFresh) {
+		if (!this.recorder.isActive()) {
 			this.setStatus(s.summary ? 'ready' : s.segments.length > 0 ? 'recorded' : 'idle');
 		}
 		this.setProgress('', 0);
 		this.refreshViews();
 		new Notice('Cancelled.');
-		// Whatever transcript/audio already exists (e.g. the segment finished
-		// transcribing before the *summary* got cancelled) must not be lost just
-		// because this particular pipeline run didn't reach its own save step —
-		// persist it now. Skip this while a new take is already recording, so we
-		// don't race that in-progress capture.
-		if (!startingFresh && (s.transcript.trim() || s.summary.trim())) {
-			this.syncNote();
-		}
 	}
 
 	private async readContextDocs(): Promise<{ path: string; content: string }[]> {
@@ -2144,7 +1250,9 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	private getVaultTags(): string[] {
 		try {
-			const tags = (this.app.metadataCache as any).getTags?.() as Record<string, number> | undefined;
+			// getTags() is an undocumented (but stable) MetadataCache method not in the typings.
+			const cache = this.app.metadataCache as unknown as { getTags?: () => Record<string, number> };
+			const tags = cache.getTags?.();
 			if (!tags) return [];
 			return Object.keys(tags)
 				.map((t) => t.replace(/^#/, ''))
@@ -2157,22 +1265,51 @@ export default class ScuttlebuttPlugin extends Plugin {
 	// ---- saving ----------------------------------------------------------
 
 	/**
-	 * Write transcript/summary/etc. into the bound note. Called automatically right
-	 * after transcription and summarization complete, so there's no separate "save"
-	 * step in the normal flow; also callable manually (via the Save button) to persist
-	 * hand-edits made afterwards (title, tags, or the summary/transcript text areas).
+	 * Reveal an already-open tab for this note instead of opening yet another one — syncNote()
+	 * runs several times over one meeting (after recording, after transcript, after summary),
+	 * so a naive "always open a new leaf" would otherwise duplicate the tab every single time.
 	 */
-	async syncNote(options: { notify?: boolean } = {}): Promise<void> {
-		const s = this.session;
-		if (!s.summary && !s.transcript && s.segments.length === 0) return;
+	private async revealOrOpenNote(path: string): Promise<void> {
+		const existing = this.app.workspace
+			.getLeavesOfType('markdown')
+			.find((leaf) => (leaf.view as { file?: TFile }).file?.path === path);
+		if (existing) {
+			this.app.workspace.setActiveLeaf(existing, { focus: true });
+			return;
+		}
+		await this.app.workspace.openLinkText(path, '', true);
+	}
 
-		const wasBusy = s.status === 'transcribing' || s.status === 'summarizing';
+	async saveNote(): Promise<void> {
+		const s = this.session;
+		if (s.segments.length === 0 && !s.summary && !s.transcript) {
+			new Notice('Nothing to save yet.');
+			return;
+		}
+		if (this.isBusy()) {
+			new Notice('Wait for the current step to finish before saving.');
+			return;
+		}
+		await this.syncNote();
+		if (s.savedNotePath && !s.error) new Notice('Meeting note saved: ' + s.savedNotePath);
+	}
+
+	/**
+	 * Auto-save: writes/updates the note without user-facing "nothing to save" chatter.
+	 * Called after every recording and after transcription/summary complete, so there is
+	 * never a manual "Save" step required. Safe to call mid-pipeline (e.g. right after a
+	 * take is recorded, before it's even transcribed) — status/progress are only touched
+	 * when nothing else is already in progress.
+	 */
+	async syncNote(): Promise<void> {
+		const s = this.session;
+		if (s.segments.length === 0 && !s.summary && !s.transcript) return;
+		const wasBusy = this.isBusy();
 		if (!wasBusy) {
 			this.setStatus('saving');
 			this.setProgress('Saving note…', 90);
 			this.refreshViews();
 		}
-
 		try {
 			if (this.settings.saveAudio) {
 				for (const seg of s.segments) {
@@ -2181,61 +1318,89 @@ export default class ScuttlebuttPlugin extends Plugin {
 					}
 				}
 			}
-
-			const notePath = await this.writeNote();
+			const notePath =
+				s.foreignNote && s.savedNotePath ? await this.mergeIntoForeignNote(s.savedNotePath) : await this.writeNote();
 			s.savedNotePath = notePath;
 			if (!wasBusy) {
-				this.setStatus('ready');
+				this.setStatus(s.summary ? 'ready' : 'recorded');
 				this.setProgress('Saved ✓', 100);
+				this.refreshViews();
+				if (this.settings.autoOpenNote) void this.revealOrOpenNote(notePath);
+				window.setTimeout(() => this.clearProgressIfIdle(), 4000);
 			}
-			this.refreshViews();
-			if (options.notify) {
-				new Notice('Meeting note saved: ' + notePath);
-				if (this.settings.autoOpenNote) this.app.workspace.openLinkText(notePath, '', true);
+		} catch (err) {
+			s.error = 'Could not save note: ' + errorMessage(err);
+			if (!wasBusy) {
+				this.setStatus('error');
+				this.setProgress('', 0);
+				this.refreshViews();
 			}
-			if (!wasBusy) window.setTimeout(() => this.clearProgressIfIdle(), 4000);
-		} catch (err: any) {
-			s.error = 'Could not save note: ' + (err?.message ?? err);
-			this.setStatus('error');
-			this.setProgress('', 0);
-			this.refreshViews();
 			new Notice(s.error);
 		}
-	}
-
-	/** Manual "Save" button: same write as the automatic sync, but always confirms. */
-	async saveNote(): Promise<void> {
-		if (!this.session.summary && !this.session.transcript) {
-			new Notice('Nothing to save yet.');
-			return;
-		}
-		await this.syncNote({ notify: true });
 	}
 
 	private async saveSegmentAudio(segment: AudioSegment): Promise<string> {
 		await this.ensureFolder(this.settings.audioFolder);
 		const ext = (segment.audioName.split('.').pop() || 'webm').toLowerCase();
-		const base = sanitizeFileName(segment.audioName.replace(/\.[^./]+$/, ''));
+		// segment.id is "<epoch-ms-when-recorded/imported>-<random>" (see stopRecording,
+		// importFromVault/Disk, scuttlebuttifyActiveNote) — use that moment, not whenever
+		// the save happens to run, so the filename reflects when it was actually recorded.
+		const recordedAt = Number(segment.id.split('-')[0]);
+		const stampDate = Number.isFinite(recordedAt) ? new Date(recordedAt) : new Date();
+		const base = sanitizeFileName(`Recording ${recordingStamp(stampDate)}`);
 		const path = await this.uniquePath(this.settings.audioFolder, base, ext);
 		await this.app.vault.createBinary(path, segment.audioData!);
 		return path;
 	}
 
+	/**
+	 * Rename the saved note to match the current title, once one is known — needed now
+	 * that the note file exists (with a generic "Meeting" name) before any title does.
+	 * writeNote() itself never renames an existing file, only updates its content, so
+	 * without this the file would stay named "Meeting" forever. Never touches a note we
+	 * don't own (foreignNote) or one that isn't saved yet.
+	 */
+	private async renameNoteToMatchTitle(): Promise<void> {
+		const s = this.session;
+		if (!s.savedNotePath || s.foreignNote) return;
+		const file = this.app.vault.getAbstractFileByPath(s.savedNotePath);
+		if (!(file instanceof TFile)) return;
+		const title = s.title.trim() || 'Meeting';
+		const idealBase = sanitizeFileName(
+			applyTemplate(this.settings.filenameTemplate || DEFAULT_FILENAME_TEMPLATE, {
+				date: todayStamp(new Date()),
+				title,
+			})
+		);
+		if (file.basename === idealBase) return;
+		const newPath = await this.uniquePath(this.settings.notesFolder, idealBase, 'md');
+		try {
+			await this.app.fileManager.renameFile(file, newPath);
+			s.savedNotePath = newPath;
+		} catch (err) {
+			console.warn('Scuttlebutt: could not rename note to match title', err);
+		}
+	}
+
 	private async writeNote(): Promise<string> {
 		const s = this.session;
-
-		if (s.foreignNote && s.savedNotePath) {
-			return await this.mergeIntoForeignNote(s.savedNotePath);
-		}
-
 		await this.ensureFolder(this.settings.notesFolder);
 
 		const now = new Date();
 		const title = s.title.trim() || 'Meeting';
+		const base = sanitizeFileName(
+			applyTemplate(this.settings.filenameTemplate || DEFAULT_FILENAME_TEMPLATE, {
+				date: todayStamp(now),
+				title,
+			})
+		);
+		const existing = s.savedNotePath ? this.app.vault.getAbstractFileByPath(s.savedNotePath) : null;
+		const path =
+			existing instanceof TFile ? existing.path : await this.uniquePath(this.settings.notesFolder, base, 'md');
 
 		const fm: string[] = ['---'];
 		fm.push('scuttlebutt: true');
-		fm.push(`date created: ${yamlString(moment(now).format(this.settings.dateFormat || DEFAULT_DATE_FORMAT))}`);
+		fm.push(`date created: ${yamlString(mmt(now).format(this.settings.dateFormat || DEFAULT_DATE_FORMAT))}`);
 		if (s.tags.length > 0) fm.push(`tags: [${s.tags.map(yamlString).join(', ')}]`);
 		if (s.participants.length > 0) {
 			fm.push(`participants: [${s.participants.map(yamlString).join(', ')}]`);
@@ -2244,52 +1409,24 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 		const parts: string[] = [fm.join('\n')];
 
-		const audioLinks = s.segments.map((seg) => seg.audioSourcePath).filter((p): p is string => !!p);
-		for (const link of audioLinks) parts.push(`![[${link}]]`);
-		if (audioLinks.length > 0) parts.push('');
+		for (const seg of s.segments) {
+			if (seg.audioSourcePath) parts.push(`![[${seg.audioSourcePath}]]`, '');
+		}
 
 		parts.push(s.summary.trim() || '*No summary generated.*');
 
-		// Live-typed notes from the quick-start note take precedence over the sidebar
-		// Memo field — they're the same idea, but typed in a real editor.
-		const liveNoteContent = await this.readLiveNoteContent();
-		const memoContent = liveNoteContent.trim() || s.memo.trim();
-		if (this.settings.includeMemo && memoContent) {
-			parts.push('', calloutBlock('quote', 'Memo', memoContent, true));
+		if (this.settings.includeMemo && s.memo.trim()) {
+			parts.push('', calloutBlock('quote', 'Memo', s.memo.trim(), true));
 		}
 		if (this.settings.includeTranscript && s.transcript.trim()) {
 			parts.push('', calloutBlock('note', 'Transcript', s.transcript.trim(), true));
 		}
 
-		const content = parts.join('\n') + '\n';
-		const base = sanitizeFileName(`${todayStamp(now)} — ${title}`);
-
-		// If quick-start already created a live note, rename & fill that same file
-		// instead of creating a second one — keeps everything as one tidy note.
-		if (s.liveNotePath) {
-			const existing = this.app.vault.getAbstractFileByPath(s.liveNotePath);
-			if (existing instanceof TFile) {
-				const newPath = await this.uniquePath(this.settings.notesFolder, base, 'md', existing.path);
-				if (newPath !== existing.path) {
-					await this.app.fileManager.renameFile(existing, newPath);
-				}
-				await this.app.vault.modify(existing, content);
-				return existing.path;
-			}
+		if (existing instanceof TFile) {
+			await this.app.vault.modify(existing, parts.join('\n') + '\n');
+			return existing.path;
 		}
-
-		// A note that was already loaded (opened from the vault, not created just now)
-		// keeps its existing name — only its content is refreshed in place.
-		if (s.savedNotePath) {
-			const existing = this.app.vault.getAbstractFileByPath(s.savedNotePath);
-			if (existing instanceof TFile) {
-				await this.app.vault.modify(existing, content);
-				return existing.path;
-			}
-		}
-
-		const path = await this.uniquePath(this.settings.notesFolder, base, 'md');
-		const file = await this.app.vault.create(path, content);
+		const file = await this.app.vault.create(path, parts.join('\n') + '\n');
 		return file.path;
 	}
 
@@ -2305,10 +1442,15 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 		// Merge the scuttlebutt flag + tags into whatever frontmatter is already there —
 		// Obsidian's own API handles this without disturbing other keys.
-		await this.app.fileManager.processFrontMatter(file, (fm) => {
+		await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
 			fm.scuttlebutt = true;
 			if (s.tags.length > 0) {
-				const existing: string[] = Array.isArray(fm.tags) ? fm.tags : fm.tags ? [fm.tags] : [];
+				const current = fm.tags;
+				const existing: string[] = Array.isArray(current)
+					? current.map(String)
+					: typeof current === 'string' && current
+						? [current]
+						: [];
 				fm.tags = Array.from(new Set([...existing, ...s.tags]));
 			}
 		});
@@ -2326,13 +1468,12 @@ export default class ScuttlebuttPlugin extends Plugin {
 			.map((seg) => seg.audioSourcePath)
 			.filter((p): p is string => !!p && !alreadyEmbedded.has(p));
 
-		const memoContent = (await this.readLiveNoteContent()).trim() || s.memo.trim();
 		const blockParts: string[] = [];
 		for (const link of newAudioLinks) blockParts.push(`![[${link}]]`);
 		if (newAudioLinks.length > 0) blockParts.push('');
 		blockParts.push(s.summary.trim() || '*No summary generated.*');
-		if (this.settings.includeMemo && memoContent) {
-			blockParts.push('', calloutBlock('quote', 'Memo', memoContent, true));
+		if (this.settings.includeMemo && s.memo.trim()) {
+			blockParts.push('', calloutBlock('quote', 'Memo', s.memo.trim(), true));
 		}
 		if (this.settings.includeTranscript && s.transcript.trim()) {
 			blockParts.push('', calloutBlock('note', 'Transcript', s.transcript.trim(), true));
@@ -2350,79 +1491,26 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	// ---- reset -----------------------------------------------------------
 
+	/** Drop a take from the session (the underlying vault file, if any, is left alone —
+	 * only our tracking of it is removed) and resync the note to match. */
+	removeSegment(id: string): void {
+		const s = this.session;
+		const idx = s.segments.findIndex((seg) => seg.id === id);
+		if (idx === -1) return;
+		s.segments.splice(idx, 1);
+		s.transcript = s.segments
+			.map((seg) => seg.transcript)
+			.filter((t) => t.trim())
+			.join('\n\n---\n\n');
+		if (s.segments.length === 0 && !s.summary) this.setStatus('idle');
+		this.refreshViews();
+		void this.syncNote();
+	}
+
 	resetSession(): void {
 		if (this.recorder.isRecording()) this.recorder.abort();
 		this.stopStatusBarTimer();
-		this.session = newSession(this.settings.sttDiarize);
-		this.refreshViews();
-	}
-
-	// ---- loading an existing note ----------------------------------------
-
-	private isScuttlebuttNote(file: TFile): boolean {
-		return !!this.app.metadataCache.getFileCache(file)?.frontmatter?.scuttlebutt;
-	}
-
-	/**
-	 * Load a previously saved Scuttlebutt note's audio, transcript, summary, tags
-	 * and participants back into the session, so the sidebar acts like a
-	 * properties panel for whichever such note is currently open: edit tags,
-	 * re-transcribe, re-summarize, or add another recording to it.
-	 */
-	private async loadNoteIntoSession(file: TFile): Promise<void> {
-		const content = await this.app.vault.read(file);
-		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
-		const fmEnd = content.indexOf('\n---', 3);
-		const fullBody = fmEnd === -1 ? content : content.slice(fmEnd + 4).trim();
-
-		// A note we merged into (rather than created) keeps its own content around our
-		// marked block — only parse summary/transcript/memo from inside that block, but
-		// still scan the whole file for audio embeds, since those live wherever the user
-		// originally put them.
-		const markerRe = /<!--scuttlebutt:start-->\n([\s\S]*?)\n<!--scuttlebutt:end-->/;
-		const markerMatch = fullBody.match(markerRe);
-		const isForeign = !!markerMatch;
-		const body = isForeign ? markerMatch![1] : fullBody;
-
-		const s = newSession(this.settings.sttDiarize);
-		s.foreignNote = isForeign;
-		s.title = file.basename.replace(/^\d{4}-\d{2}-\d{2} — /, '');
-		s.tags = Array.isArray(fm.tags) ? fm.tags.map(String) : [];
-		s.participants = Array.isArray(fm.participants) ? fm.participants.map(String) : [];
-
-		for (const link of extractAudioEmbeds(fullBody)) {
-			const target = this.app.metadataCache.getFirstLinkpathDest(link, file.path);
-			s.segments.push({
-				id: target?.path ?? link,
-				audioData: null,
-				audioMime: target ? this.mimeForExtension(target.extension) : 'audio/webm',
-				audioName: target?.name ?? link,
-				audioSourcePath: target?.path ?? link,
-				transcript: '',
-			});
-		}
-
-		const transcript = extractCallout(body, 'note', 'Transcript') ?? '';
-		if (s.segments.length > 0) {
-			// The combined transcript is segments joined by "\n\n---\n\n" (see
-			// recomputeTranscript) — split back along that same separator so each
-			// segment keeps its own text where possible.
-			const chunks = transcript.split(/\n\n---\n\n/);
-			if (chunks.length === s.segments.length) {
-				s.segments.forEach((seg, i) => (seg.transcript = chunks[i]));
-			} else {
-				s.segments[s.segments.length - 1].transcript = transcript;
-			}
-		}
-		s.transcript = transcript;
-
-		const memo = extractCallout(body, 'quote', 'Memo');
-		if (memo) s.memo = memo;
-		s.summary = extractSummaryBody(body);
-
-		s.savedNotePath = file.path;
-		s.status = s.summary ? 'ready' : s.segments.length > 0 ? 'recorded' : 'idle';
-		this.session = s;
+		this.session = newSession(this.settings.sttDiarize, this.settings.reasoningEffort, this.settings.streamSummary);
 		this.refreshViews();
 	}
 
@@ -2446,11 +1534,11 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	private async uniquePath(folder: string, base: string, ext: string, excludePath?: string): Promise<string> {
+	private async uniquePath(folder: string, base: string, ext: string): Promise<string> {
 		const dir = normalizePath(folder);
 		let candidate = normalizePath(`${dir}/${base}.${ext}`);
 		let i = 2;
-		while (candidate !== excludePath && this.app.vault.getAbstractFileByPath(candidate)) {
+		while (this.app.vault.getAbstractFileByPath(candidate)) {
 			candidate = normalizePath(`${dir}/${base} (${i}).${ext}`);
 			i++;
 		}
@@ -2471,480 +1559,20 @@ export default class ScuttlebuttPlugin extends Plugin {
 			window.clearInterval(this.statusBarTimer);
 			this.statusBarTimer = null;
 		}
-		if (this.statusBarEl) this.statusBarEl.style.display = 'none';
+		if (this.statusBarEl) this.statusBarEl.addClass('mh-hidden');
 	}
 
 	private updateStatusBar(): void {
 		if (!this.statusBarEl) return;
-		if (this.session.status === 'recording' && this.session.startedAt) {
-			this.statusBarEl.style.display = '';
+		if (this.session.status === 'recording') {
+			this.statusBarEl.removeClass('mh-hidden');
 			this.statusBarEl.empty();
 			this.statusBarEl.createSpan({ cls: 'mh-sb-dot' });
-			this.statusBarEl.createSpan({ text: ' ' + formatDuration(Date.now() - this.session.startedAt) });
+			const t = formatDuration(recordedMs(this.session.activeMs, this.session.segmentStartedAt, Date.now()));
+			this.statusBarEl.createSpan({ text: ' ' + t + (this.session.paused ? ' (paused)' : '') });
 			this.statusBarEl.onclick = () => this.activateView();
 		} else {
-			this.statusBarEl.style.display = 'none';
+			this.statusBarEl.addClass('mh-hidden');
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Settings tab
-// ---------------------------------------------------------------------------
-
-class ScuttlebuttSettingTab extends PluginSettingTab {
-	private audioInputs: MediaDeviceInfo[] = [];
-	private deviceDropdown: DropdownComponent | null = null;
-	private systemDeviceDropdown: DropdownComponent | null = null;
-
-	constructor(app: App, private plugin: ScuttlebuttPlugin) {
-		super(app, plugin);
-	}
-
-	/** Request mic permission (to unlock device labels), then list audio inputs and re-render. */
-	private async detectDevices(): Promise<void> {
-		try {
-			const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
-			probe.getTracks().forEach((t) => t.stop());
-		} catch {
-			new Notice('Microphone permission is needed to list input devices.');
-		}
-		try {
-			const devices = await navigator.mediaDevices.enumerateDevices();
-			this.audioInputs = devices.filter((d) => d.kind === 'audioinput');
-			new Notice(`Found ${this.audioInputs.length} input device${this.audioInputs.length === 1 ? '' : 's'}.`);
-		} catch {
-			this.audioInputs = [];
-		}
-		// Repopulate the device dropdowns in place rather than this.display(), which
-		// would rebuild the settings tab and scroll it back to the top.
-		if (this.deviceDropdown) this.populateDeviceDropdown(this.deviceDropdown, 'inputDeviceId', 'System default');
-		if (this.systemDeviceDropdown) {
-			this.populateDeviceDropdown(this.systemDeviceDropdown, 'systemAudioDeviceId', 'Off');
-		}
-	}
-
-	/** Fill a device dropdown from the detected inputs. Used on first render and after
-	 *  re-detecting, so a refresh doesn't rebuild the whole settings tab. */
-	private populateDeviceDropdown(
-		d: DropdownComponent,
-		key: 'inputDeviceId' | 'systemAudioDeviceId',
-		firstLabel: string
-	): void {
-		d.selectEl.empty();
-		d.addOption('', firstLabel);
-		for (const dev of this.audioInputs) {
-			d.addOption(dev.deviceId, dev.label || `Input (${dev.deviceId.slice(0, 6)}…)`);
-		}
-		const saved = this.plugin.settings[key];
-		d.setValue(this.audioInputs.some((x) => x.deviceId === saved) ? saved : '');
-	}
-
-	display(): void {
-		const { containerEl } = this;
-		containerEl.empty();
-		containerEl.addClass('mh-settings');
-
-		this.endpointSection(containerEl, {
-			heading: 'Transcription',
-			desc: 'Your Whisper / vLLM speech-to-text server (OpenAI-compatible).',
-			endpointKey: 'sttEndpoint',
-			apiKeyKey: 'sttApiKey',
-			modelKey: 'sttModel',
-			modelsKey: 'sttModels',
-			timeoutKey: 'sttTimeout',
-		});
-
-		new Setting(containerEl)
-			.setName('Language')
-			.setDesc('Spoken language hint for transcription (e.g. en, zh, ja). Use "auto" to let the model detect.')
-			.addText((t) =>
-				t.setValue(this.plugin.settings.sttLanguage).onChange(async (v) => {
-					this.plugin.settings.sttLanguage = v.trim();
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Identify speakers')
-			.setDesc(
-				'Default for new recordings: ask the server to label who said what (diarization). ' +
-					'You can flip it per recording in the sidebar. Requires a diarizing endpoint such as ' +
-					'the WhisperX server; plain Whisper/vLLM will ignore it.'
-			)
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.sttDiarize).onChange(async (v) => {
-					this.plugin.settings.sttDiarize = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		this.endpointSection(containerEl, {
-			heading: 'Summary',
-			desc: 'Your LLM / vLLM chat server (OpenAI-compatible). Used for summaries, titles, and tags.',
-			endpointKey: 'llmEndpoint',
-			apiKeyKey: 'llmApiKey',
-			modelKey: 'llmModel',
-			modelsKey: 'llmModels',
-			timeoutKey: 'llmTimeout',
-		});
-
-		new Setting(containerEl).setName('Capture').setHeading();
-
-		new Setting(containerEl)
-			.setName('Input device')
-			.setDesc(
-				'Which microphone/input to record. To capture system audio on macOS, install a loopback ' +
-					'device (e.g. BlackHole) and record from an aggregate device that includes it, then select it here.'
-			)
-			.addDropdown((d) => {
-				this.deviceDropdown = d;
-				this.populateDeviceDropdown(d, 'inputDeviceId', 'System default');
-				d.onChange(async (v) => {
-					this.plugin.settings.inputDeviceId = v;
-					await this.plugin.saveSettings();
-				});
-			})
-			.addExtraButton((b) =>
-				b
-					.setIcon('refresh-cw')
-					.setTooltip('Detect input devices')
-					.onClick(() => this.detectDevices())
-			);
-
-		new Setting(containerEl)
-			.setName('System audio device')
-			.setDesc(
-				'Optional second input, recorded alongside the mic and mixed into one track. Pick a ' +
-					'loopback device that carries system/meeting audio (e.g. BlackHole on macOS). ' +
-					'Leave "Off" to record the microphone only.'
-			)
-			.addDropdown((d) => {
-				this.systemDeviceDropdown = d;
-				this.populateDeviceDropdown(d, 'systemAudioDeviceId', 'Off');
-				d.onChange(async (v) => {
-					this.plugin.settings.systemAudioDeviceId = v;
-					await this.plugin.saveSettings();
-				});
-			})
-			.addExtraButton((b) =>
-				b
-					.setIcon('refresh-cw')
-					.setTooltip('Detect input devices')
-					.onClick(() => this.detectDevices())
-			);
-
-		new Setting(containerEl)
-			.setName('Capture system audio')
-			.setDesc(
-				'Alternative to the device above: mix in system audio via a screen-share prompt. ' +
-					'Works on some platforms but not reliably on macOS — if no system audio is captured ' +
-					'you will be told, and recording continues with the microphone. On macOS, prefer the ' +
-					'"System audio device" option above.'
-			)
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.captureSystemAudio).onChange(async (v) => {
-					this.plugin.settings.captureSystemAudio = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl).setName('Behavior').setHeading();
-
-		new Setting(containerEl)
-			.setName('Auto-summarize after transcription')
-			.setDesc('Generate the summary automatically once a transcript is ready.')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.autoSummarize).onChange(async (v) => {
-					this.plugin.settings.autoSummarize = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Suggest a title')
-			.setDesc('Let the model name the meeting (anarlog-style concise topic).')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.generateTitle).onChange(async (v) => {
-					this.plugin.settings.generateTitle = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Suggest tags')
-			.setDesc('Let the model propose 3–5 tags, reusing your existing vault tags where relevant.')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.generateTags).onChange(async (v) => {
-					this.plugin.settings.generateTags = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Summary language')
-			.setDesc('The language the summary and title are written in.')
-			.addText((t) =>
-				t.setValue(this.plugin.settings.language).onChange(async (v) => {
-					this.plugin.settings.language = v.trim() || 'English';
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl).setName('Output').setHeading();
-
-		new Setting(containerEl)
-			.setName('Notes folder')
-			.setDesc('Where meeting notes are written.')
-			.addText((t) =>
-				t.setValue(this.plugin.settings.notesFolder).onChange(async (v) => {
-					this.plugin.settings.notesFolder = v.trim() || 'Scuttlebutt/Notes';
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Audio folder')
-			.setDesc('Where recordings are saved (when "Save audio" is on).')
-			.addText((t) =>
-				t.setValue(this.plugin.settings.audioFolder).onChange(async (v) => {
-					this.plugin.settings.audioFolder = v.trim() || 'Scuttlebutt/Audio';
-					await this.plugin.saveSettings();
-				})
-			);
-
-		let datePreview: HTMLElement | null = null;
-		new Setting(containerEl)
-			.setName('Date format')
-			.setDesc('Moment.js tokens for the note\'s date property.')
-			.addText((t) =>
-				t.setValue(this.plugin.settings.dateFormat).onChange(async (v) => {
-					this.plugin.settings.dateFormat = v || DEFAULT_DATE_FORMAT;
-					await this.plugin.saveSettings();
-					if (datePreview) {
-						datePreview.setText('Preview: ' + moment().format(this.plugin.settings.dateFormat));
-					}
-				})
-			)
-			.then((s) => {
-				datePreview = s.descEl.createDiv({ cls: 'mh-hint' });
-				datePreview.setText('Preview: ' + moment().format(this.plugin.settings.dateFormat || DEFAULT_DATE_FORMAT));
-			});
-
-		new Setting(containerEl)
-			.setName('Save audio into the vault')
-			.setDesc('Store the recording and embed a player in the note.')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.saveAudio).onChange(async (v) => {
-					this.plugin.settings.saveAudio = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Include transcript in note')
-			.setDesc('Append the full transcript inside a collapsible callout.')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.includeTranscript).onChange(async (v) => {
-					this.plugin.settings.includeTranscript = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Include memo in note')
-			.setDesc('Append your own notes inside a collapsible callout.')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.includeMemo).onChange(async (v) => {
-					this.plugin.settings.includeMemo = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl)
-			.setName('Auto-open note after saving')
-			.addToggle((t) =>
-				t.setValue(this.plugin.settings.autoOpenNote).onChange(async (v) => {
-					this.plugin.settings.autoOpenNote = v;
-					await this.plugin.saveSettings();
-				})
-			);
-
-		new Setting(containerEl).setName('Summary prompt').setHeading();
-		let promptArea!: TextAreaComponent;
-		new Setting(containerEl)
-			.setName('System prompt')
-			.setDesc('Sent as the system message. Use {{language}} where the language should appear.')
-			.addTextArea((t) => {
-				promptArea = t;
-				t.setValue(this.plugin.settings.summaryPrompt).onChange(async (v) => {
-					this.plugin.settings.summaryPrompt = v;
-					await this.plugin.saveSettings();
-				});
-				t.inputEl.rows = 10;
-				t.inputEl.addClass('mh-settings-textarea');
-			})
-			.addExtraButton((b) =>
-				b
-					.setIcon('rotate-ccw')
-					.setTooltip('Reset to default')
-					.onClick(async () => {
-						this.plugin.settings.summaryPrompt = DEFAULT_SUMMARY_PROMPT;
-						await this.plugin.saveSettings();
-						// Update in place instead of this.display(), which would jump the
-						// settings page back to the top.
-						promptArea.setValue(DEFAULT_SUMMARY_PROMPT);
-					})
-			);
-	}
-
-	private endpointSection(
-		containerEl: HTMLElement,
-		opts: {
-			heading: string;
-			desc: string;
-			endpointKey: 'sttEndpoint' | 'llmEndpoint';
-			apiKeyKey: 'sttApiKey' | 'llmApiKey';
-			modelKey: 'sttModel' | 'llmModel';
-			modelsKey: 'sttModels' | 'llmModels';
-			timeoutKey: 'sttTimeout' | 'llmTimeout';
-		}
-	): void {
-		const settings = this.plugin.settings;
-		new Setting(containerEl).setName(opts.heading).setDesc(opts.desc).setHeading();
-
-		let urlText!: TextComponent;
-		new Setting(containerEl)
-			.setName('Endpoint URL')
-			.setDesc('Base URL ending in /v1')
-			.addText((t) => {
-				urlText = t;
-				t.setPlaceholder('http://localhost:8000/v1')
-					.setValue(settings[opts.endpointKey])
-					.onChange(async (v) => {
-						settings[opts.endpointKey] = v.trim();
-						await this.plugin.saveSettings();
-					});
-			})
-			.addExtraButton((b) =>
-				b
-					.setIcon('rotate-ccw')
-					.setTooltip('Reset to default URL')
-					.onClick(async () => {
-						settings[opts.endpointKey] = DEFAULT_SETTINGS[opts.endpointKey];
-						await this.plugin.saveSettings();
-						// Update the field in place — this.display() would rebuild the whole
-						// settings tab and scroll it back to the top.
-						urlText.setValue(settings[opts.endpointKey]);
-					})
-			);
-
-		new Setting(containerEl)
-			.setName('API key')
-			.setDesc('Leave empty if the server needs no auth.')
-			.addText((t) => {
-				t.inputEl.type = 'password';
-				t.setPlaceholder('sk-…')
-					.setValue(settings[opts.apiKeyKey])
-					.onChange(async (v) => {
-						settings[opts.apiKeyKey] = v.trim();
-						await this.plugin.saveSettings();
-					});
-			});
-
-		// Repopulate the model dropdown in place (no full re-render), so the test
-		// status message beside the button stays visible instead of flashing away.
-		let dropdown: DropdownComponent | null = null;
-		const populate = (d: DropdownComponent) => {
-			d.selectEl.empty();
-			const models = settings[opts.modelsKey];
-			if (models.length === 0) {
-				d.addOption('', '— test the endpoint first —');
-				d.setDisabled(true);
-			} else {
-				for (const m of models) d.addOption(m.id, m.name);
-				const current = settings[opts.modelKey];
-				const value = models.some((m) => m.id === current) ? current : models[0].id;
-				settings[opts.modelKey] = value;
-				d.setValue(value);
-				d.setDisabled(false);
-			}
-		};
-
-		new Setting(containerEl)
-			.setName('Model')
-			.setDesc('Populated after a successful test.')
-			.addDropdown((d) => {
-				dropdown = d;
-				populate(d);
-				d.onChange(async (v) => {
-					settings[opts.modelKey] = v;
-					await this.plugin.saveSettings();
-				});
-			});
-
-		const timeoutKey = opts.timeoutKey;
-		let timeoutText!: TextComponent;
-		new Setting(containerEl)
-			.setName('Request timeout')
-			.setDesc(
-				'Seconds to wait for the server before giving up. Set 0 to wait ' +
-					'indefinitely — useful for long recordings on a slow or busy server.'
-			)
-			.addText((t) => {
-				timeoutText = t;
-				t.inputEl.type = 'number';
-				t.inputEl.min = '0';
-				t.inputEl.step = '5';
-				t.setValue(String(settings[timeoutKey])).onChange(async (v) => {
-					const n = Number(v);
-					if (Number.isFinite(n) && n >= 0) {
-						settings[timeoutKey] = Math.floor(n);
-						await this.plugin.saveSettings();
-					}
-				});
-			})
-			.addExtraButton((b) =>
-				b
-					.setIcon('rotate-ccw')
-					.setTooltip('Reset to default')
-					.onClick(async () => {
-						settings[timeoutKey] = DEFAULT_SETTINGS[timeoutKey];
-						await this.plugin.saveSettings();
-						timeoutText.setValue(String(settings[timeoutKey]));
-					})
-			);
-
-		const statusEl = createSpan({ cls: 'mh-test-status' });
-
-		new Setting(containerEl)
-			.setName('Test connection')
-			.setDesc('Validates the endpoint and loads its model list (10s timeout).')
-			.then((setting) => setting.controlEl.prepend(statusEl))
-			.addButton((b) =>
-				b.setButtonText('Test').onClick(async () => {
-					b.setButtonText('Testing…').setDisabled(true);
-					statusEl.setText('Testing…');
-					statusEl.removeClass('is-ok', 'is-err');
-					const result = await testEndpoint(settings[opts.endpointKey], settings[opts.apiKeyKey]);
-					if (result.ok) {
-						settings[opts.modelsKey] = result.models;
-						if (!result.models.some((m) => m.id === settings[opts.modelKey])) {
-							settings[opts.modelKey] = result.models[0]?.id ?? '';
-						}
-						statusEl.setText('✓ ' + result.message);
-						statusEl.addClass('is-ok');
-					} else {
-						// Failed test: blank the dropdown, per spec.
-						settings[opts.modelsKey] = [];
-						settings[opts.modelKey] = '';
-						statusEl.setText('✕ ' + result.message);
-						statusEl.addClass('is-err');
-					}
-					await this.plugin.saveSettings();
-					if (dropdown) populate(dropdown);
-					b.setButtonText('Test').setDisabled(false);
-				})
-			);
 	}
 }

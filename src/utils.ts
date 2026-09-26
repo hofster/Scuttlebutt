@@ -27,13 +27,23 @@ export function formatDuration(ms: number): string {
 	return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/**
+ * Total recorded milliseconds: time banked from completed segments (`activeMs`)
+ * plus the current live segment (`now - segmentStartedAt`). While paused,
+ * `segmentStartedAt` is null and the value freezes at `activeMs`. Never negative.
+ */
+export function recordedMs(activeMs: number, segmentStartedAt: number | null, now: number): number {
+	const live = segmentStartedAt !== null ? Math.max(0, now - segmentStartedAt) : 0;
+	return activeMs + live;
+}
+
 /** Local-date stamp as YYYY-MM-DD. */
 export function todayStamp(d: Date): string {
 	const pad = (n: number) => n.toString().padStart(2, '0');
 	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** Local timestamp as YYYYMMDDHHmmss — matches the core Audio recorder plugin's file naming. */
+/** Compact YYYYMMDDHHmmss timestamp, e.g. for "Recording 20260917143022" filenames. */
 export function recordingStamp(d: Date): string {
 	const pad = (n: number) => n.toString().padStart(2, '0');
 	return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
@@ -42,7 +52,7 @@ export function recordingStamp(d: Date): string {
 /** Strip characters that are illegal in file names or that anarlog forbids in titles. */
 export function sanitizeTitle(raw: string): string {
 	return raw
-		.replace(/[\*"'`\(\)\[\]\{\}:;\\/<>|?]/g, ' ')
+		.replace(/[*"'`()[\]{}:;\\/<>|?]/g, ' ')
 		.replace(/\s+/g, ' ')
 		.trim();
 }
@@ -51,7 +61,7 @@ export function sanitizeTitle(raw: string): string {
 export function sanitizeFileName(raw: string): string {
 	return (
 		raw
-			.replace(/[\\/:*?"<>|#\^\[\]]/g, '')
+			.replace(/[\\/:*?"<>|#^[\]]/g, '')
 			.replace(/\s+/g, ' ')
 			.trim()
 			.slice(0, 120) || 'Meeting'
@@ -69,6 +79,106 @@ export function normalizeTag(raw: string): string {
 		.replace(/^-+|-+$/g, '');
 }
 
+/**
+ * Split a reasoning-model response into the answer and the "thinking" (Qwen3
+ * `<think>…</think>`, etc.). Handles complete blocks, a dangling open block left by a
+ * truncated or still-streaming generation, and an orphan closing tag emitted when a
+ * reasoning parser has already consumed the opening `<think>`. Both parts are trimmed.
+ */
+export function splitReasoning(text: string): { answer: string; reasoning: string } {
+	const reasoning: string[] = [];
+	let answer = '';
+	const blockRe = /<think>([\s\S]*?)<\/think>/gi;
+	let lastIndex = 0;
+	let m: RegExpExecArray | null;
+	while ((m = blockRe.exec(text)) !== null) {
+		answer += text.slice(lastIndex, m.index);
+		reasoning.push(m[1]);
+		lastIndex = blockRe.lastIndex;
+	}
+	const tail = text.slice(lastIndex);
+	const openIdx = tail.search(/<think>/i);
+	const closeIdx = tail.search(/<\/think>/i);
+	if (closeIdx !== -1 && (openIdx === -1 || closeIdx < openIdx)) {
+		// Orphan close: the opening tag was consumed upstream — reasoning up to the close.
+		reasoning.push(tail.slice(0, closeIdx));
+		answer += tail.slice(closeIdx + '</think>'.length);
+	} else if (openIdx !== -1) {
+		// Dangling open (truncated or still streaming): everything after it is reasoning.
+		answer += tail.slice(0, openIdx);
+		reasoning.push(tail.slice(openIdx + '<think>'.length));
+	} else {
+		answer += tail;
+	}
+	return { answer: answer.trim(), reasoning: reasoning.join('\n').trim() };
+}
+
+/** Remove reasoning-model "thinking" blocks from a response, keeping only the answer. */
+export function stripThink(text: string): string {
+	return splitReasoning(text).answer;
+}
+
+/** How hard a reasoning model should think before answering (OpenAI-style effort ladder). */
+export type ReasoningLevel = 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+/** Per-level token headroom reserved for a thinking model (`off` is always 0). */
+export type ReasoningBudgets = Record<Exclude<ReasoningLevel, 'off'>, number>;
+
+/** Default answer-token budget for a summary (before any reasoning headroom). */
+export const DEFAULT_SUMMARY_MAX_TOKENS = 8192;
+
+/** Default per-level reasoning headroom. Users can override these in settings. */
+export const DEFAULT_REASONING_BUDGETS: ReasoningBudgets = {
+	low: 2048,
+	medium: 4096,
+	high: 8192,
+	xhigh: 16384,
+	max: 32768,
+};
+
+/**
+ * Map a reasoning level to the extra chat-request params and the token headroom to
+ * add on top of a call's answer budget. `off` disables thinking (Qwen3's
+ * `enable_thinking:false`); the effort levels enable thinking, pass `reasoning_effort`
+ * for servers that honor it, and reserve room so the reasoning never eats the answer.
+ * Unknown params are ignored by servers that don't use them, so this is safe to send
+ * to any OpenAI-compatible endpoint. `budgets` supplies the per-level headroom.
+ */
+export function reasoningParams(
+	level: ReasoningLevel,
+	budgets: ReasoningBudgets = DEFAULT_REASONING_BUDGETS
+): { params: Record<string, unknown>; headroom: number } {
+	if (level === 'off') {
+		return { params: { chat_template_kwargs: { enable_thinking: false } }, headroom: 0 };
+	}
+	return {
+		params: { chat_template_kwargs: { enable_thinking: true }, reasoning_effort: level },
+		headroom: budgets[level] ?? DEFAULT_REASONING_BUDGETS[level],
+	};
+}
+
+/** Substitute `{{token}}` placeholders from `vars` (unknown tokens become empty). */
+export function applyTemplate(template: string, vars: Record<string, string>): string {
+	return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key: string) => vars[key] ?? '');
+}
+
+/**
+ * True when `latest` is a strictly higher dotted version than `current`
+ * (e.g. "1.3.0" > "1.2.5"). A leading "v" is tolerated; non-numeric versions
+ * return false so a malformed tag never nags the user.
+ */
+export function isNewerVersion(latest: string, current: string): boolean {
+	const parse = (v: string) => v.replace(/^v/i, '').trim().split('.').map((n) => parseInt(n, 10));
+	const a = parse(latest);
+	const b = parse(current);
+	if (a.some(Number.isNaN) || b.some(Number.isNaN)) return false;
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		const x = a[i] ?? 0;
+		const y = b[i] ?? 0;
+		if (x !== y) return x > y;
+	}
+	return false;
+}
+
 /** Remove a leading ```markdown / ``` fence the model sometimes wraps output in. */
 export function stripCodeFences(text: string): string {
 	const trimmed = text.trim();
@@ -76,12 +186,34 @@ export function stripCodeFences(text: string): string {
 	return fence ? fence[1].trim() : trimmed;
 }
 
+/** A JSON object of unknown shape. */
+type JsonRecord = Record<string, unknown>;
+
+export function isRecord(value: unknown): value is JsonRecord {
+	return typeof value === 'object' && value !== null;
+}
+
+/** Coerce an unknown JSON value to text, treating non-primitives as empty. */
+export function str(value: unknown): string {
+	if (typeof value === 'string') return value;
+	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+	return '';
+}
+
+/** Extract a human-readable message from an unknown thrown value. */
+export function errorMessage(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	if (typeof err === 'string') return err;
+	if (isRecord(err) && typeof err.message === 'string') return err.message;
+	return 'Unknown error';
+}
+
 /** Best-effort extraction of a JSON string array from a model response. */
 export function parseTagArray(text: string): string[] {
 	const attempt = (s: string): string[] | null => {
 		try {
-			const parsed = JSON.parse(s);
-			if (Array.isArray(parsed)) return parsed.map((x) => String(x));
+			const parsed: unknown = JSON.parse(s);
+			if (Array.isArray(parsed)) return (parsed as unknown[]).map((x) => String(x));
 		} catch {
 			/* fall through */
 		}
@@ -102,7 +234,7 @@ export function parseTagArray(text: string): string[] {
  * `Speaker 2`, … in order of first appearance, and consecutive segments from the
  * same speaker are merged into a single turn.
  */
-export function formatDiarizedSegments(segments: any[]): string {
+export function formatDiarizedSegments(segments: unknown[]): string {
 	const labels = new Map<string, string>();
 	const label = (raw: string): string => {
 		if (!labels.has(raw)) labels.set(raw, `Speaker ${labels.size + 1}`);
@@ -110,9 +242,10 @@ export function formatDiarizedSegments(segments: any[]): string {
 	};
 	const turns: { who: string; text: string }[] = [];
 	for (const seg of segments) {
-		const text = String(seg?.text ?? '').trim();
+		const rec = isRecord(seg) ? seg : {};
+		const text = str(rec.text).trim();
 		if (!text) continue;
-		const who = seg?.speaker ? label(String(seg.speaker)) : 'Unknown speaker';
+		const who = rec.speaker ? label(str(rec.speaker)) : 'Unknown speaker';
 		const last = turns[turns.length - 1];
 		if (last && last.who === who) last.text += ' ' + text;
 		else turns.push({ who, text });
@@ -120,11 +253,16 @@ export function formatDiarizedSegments(segments: any[]): string {
 	return turns.map((t) => `${t.who}: ${t.text}`).join('\n').trim();
 }
 
+/** A per-segment speaker label, present only when the response was diarized. */
+function segmentHasSpeaker(seg: unknown): boolean {
+	return isRecord(seg) && !!seg.speaker;
+}
+
 /** True if a transcription response body carries any per-segment speaker labels. */
 export function responseHasSpeakers(rawText: string): boolean {
 	try {
-		const data = JSON.parse(rawText);
-		return Array.isArray(data.segments) && data.segments.some((s: any) => s && s.speaker);
+		const data: unknown = JSON.parse(rawText);
+		return isRecord(data) && Array.isArray(data.segments) && data.segments.some(segmentHasSpeaker);
 	} catch {
 		return false;
 	}
@@ -132,31 +270,45 @@ export function responseHasSpeakers(rawText: string): boolean {
 
 /** Parse a transcription API response body into plain text, tolerating many shapes. */
 export function parseTranscriptResponse(rawText: string): string {
-	let data: any;
+	let data: unknown;
 	try {
 		data = JSON.parse(rawText);
 	} catch {
 		return rawText.trim();
 	}
 	if (typeof data === 'string') return data.trim();
+	if (!isRecord(data)) return rawText.trim();
+	const segments = Array.isArray(data.segments) ? data.segments : null;
 	// Speaker-labeled segments (diarization) take priority — otherwise we'd flatten
 	// the transcript and lose the "who said what" the diarizer worked to produce.
-	if (Array.isArray(data.segments) && data.segments.some((s: any) => s && s.speaker)) {
-		return formatDiarizedSegments(data.segments);
+	if (segments && segments.some(segmentHasSpeaker)) {
+		return formatDiarizedSegments(segments);
 	}
-	if (data.text) return String(data.text).trim();
-	if (Array.isArray(data.segments)) return data.segments.map((s: any) => s.text).join(' ').trim();
-	if (data.transcript) return String(data.transcript).trim();
-	if (data.results?.channels?.[0]?.alternatives?.[0]?.transcript) {
-		return String(data.results.channels[0].alternatives[0].transcript).trim();
+	if (data.text) return str(data.text).trim();
+	if (segments) {
+		return segments.map((s) => (isRecord(s) ? str(s.text) : '')).join(' ').trim();
 	}
+	if (data.transcript) return str(data.transcript).trim();
+	const deep = deepTranscript(data);
+	if (deep !== null) return deep.trim();
 	return rawText.trim();
+}
+
+/** Pull `results.channels[0].alternatives[0].transcript` (Deepgram-style) if present. */
+function deepTranscript(data: JsonRecord): string | null {
+	const results = data.results;
+	if (!isRecord(results) || !Array.isArray(results.channels)) return null;
+	const channel = (results.channels as unknown[])[0];
+	if (!isRecord(channel) || !Array.isArray(channel.alternatives)) return null;
+	const alt = (channel.alternatives as unknown[])[0];
+	if (!isRecord(alt) || alt.transcript == null) return null;
+	return str(alt.transcript);
 }
 
 /** Quote a value for YAML frontmatter when it contains characters that need it. */
 export function yamlString(value: string): string {
-	if (/[:#\[\]{}",&*!|>%@`]/.test(value) || /^\s|\s$/.test(value)) {
-		return '"' + value.replace(/"/g, '\\"') + '"';
+	if (/[:#[\]{}",&*!|>%@`\\]/.test(value) || /^\s|\s$/.test(value)) {
+		return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
 	}
 	return value;
 }
@@ -169,54 +321,6 @@ export function calloutBlock(type: string, title: string, content: string, colla
 		.map((line) => (line.length ? `> ${line}` : '>'))
 		.join('\n');
 	return `${head}\n${body}`;
-}
-
-/** Every `![[...]]` audio embed target from a note body, in order of appearance. */
-export function extractAudioEmbeds(body: string): string[] {
-	const AUDIO_EXT = /\.(webm|m4a|mp3|mpga|wav|ogg|oga|flac|aac|mp4)$/i;
-	const re = /!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
-	const out: string[] = [];
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(body))) {
-		if (AUDIO_EXT.test(m[1])) out.push(m[1]);
-	}
-	return out;
-}
-
-/**
- * Pull the plain-text content back out of a `> [!type]- Title` callout block
- * written by calloutBlock(). Returns null if that callout isn't present.
- */
-export function extractCallout(body: string, type: string, title: string): string | null {
-	const lines = body.split('\n');
-	const headRe = new RegExp(`^>\\s*\\[!${type}\\]-?\\s*${title}\\s*$`, 'i');
-	const start = lines.findIndex((l) => headRe.test(l.trim()));
-	if (start === -1) return null;
-	const out: string[] = [];
-	for (let i = start + 1; i < lines.length; i++) {
-		const line = lines[i];
-		if (line === '>') {
-			out.push('');
-			continue;
-		}
-		if (line.startsWith('> ')) {
-			out.push(line.slice(2));
-			continue;
-		}
-		break;
-	}
-	return out.join('\n').trim();
-}
-
-/**
- * The summary portion of a note body: everything after any leading audio
- * embeds, up to the first callout block (Memo/Transcript), trimmed.
- */
-export function extractSummaryBody(body: string): string {
-	const idx = body.search(/^>\s*\[!/m);
-	let main = (idx === -1 ? body : body.slice(0, idx)).trim();
-	main = main.replace(/^(!\[\[[^\]]+\]\]\s*\n?)+/, '').trim();
-	return main;
 }
 
 /**
@@ -269,4 +373,65 @@ export function buildMultipart(
 		offset += c.length;
 	}
 	return { body: out.buffer, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+/**
+ * MediaRecorder-produced webm doesn't store its own duration, so Chromium reports
+ * Infinity/NaN until you seek — the transport shows "0:00" with no total time as a
+ * result. Seeking far past the end forces the browser to compute the real duration,
+ * then we reset the playhead to the start. Standard, widely-used workaround. Used both
+ * for the sidebar's own player and (via a document-level observer) for audio embeds
+ * Obsidian renders inside the note itself.
+ */
+export function fixMissingAudioDuration(player: HTMLAudioElement): void {
+	const check = () => {
+		if (player.duration !== Infinity && !Number.isNaN(player.duration)) return;
+		player.currentTime = 1e101;
+		const onTimeUpdate = () => {
+			player.removeEventListener('timeupdate', onTimeUpdate);
+			player.currentTime = 0;
+		};
+		player.addEventListener('timeupdate', onTimeUpdate);
+	};
+	if (player.readyState >= 1) check();
+	else player.addEventListener('loadedmetadata', check, { once: true });
+}
+
+/** Extract `![[...]]` embed targets (link text only, no alias) from note content. */
+export function extractAudioEmbeds(content: string): string[] {
+	const links: string[] = [];
+	const re = /!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(content))) links.push(m[1].trim());
+	return links;
+}
+
+/** Pull the body text out of a `> [!type]- Title` callout block written by calloutBlock(). */
+export function extractCallout(body: string, type: string, title: string): string | null {
+	const lines = body.split('\n');
+	const headRe = new RegExp(`^>\\s*\\[!${type}\\]-?\\s*${title}\\s*$`, 'i');
+	const start = lines.findIndex((l) => headRe.test(l.trim()));
+	if (start === -1) return null;
+	const out: string[] = [];
+	for (let i = start + 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (line === '>') {
+			out.push('');
+			continue;
+		}
+		if (line.startsWith('> ')) {
+			out.push(line.slice(2));
+			continue;
+		}
+		break;
+	}
+	return out.join('\n').trim();
+}
+
+/** Everything before the first callout, minus any leading audio embeds — i.e. the summary. */
+export function extractSummaryBody(body: string): string {
+	const idx = body.search(/^>\s*\[!/m);
+	let main = (idx === -1 ? body : body.slice(0, idx)).trim();
+	main = main.replace(/^(!\[\[[^\]]+\]\]\s*\n?)+/, '').trim();
+	return main;
 }
