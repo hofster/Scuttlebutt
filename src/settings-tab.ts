@@ -14,6 +14,7 @@ import {
 	DEFAULT_FILENAME_TEMPLATE,
 	DEFAULT_SETTINGS,
 	DEFAULT_SUMMARY_PROMPT,
+	GITHUB_URL,
 	mmt,
 } from './types';
 import {
@@ -138,7 +139,7 @@ export class ScuttlebuttSettingTab extends PluginSettingTab {
 				b
 					.setButtonText('Update')
 					.setCta()
-					.onClick(() => this.plugin.openCommunityPlugins())
+					.onClick(() => this.plugin.openReleasePage())
 			);
 		} else {
 			status.setDesc('Up to date.');
@@ -158,7 +159,7 @@ export class ScuttlebuttSettingTab extends PluginSettingTab {
 			.setName('GitHub')
 			.setDesc('Source code, releases, and issues.')
 			.addButton((b) =>
-				b.setButtonText('Open').onClick(() => window.open('https://github.com/qkm2000/Scuttlebutt'))
+				b.setButtonText('Open').onClick(() => window.open(GITHUB_URL))
 			);
 	}
 

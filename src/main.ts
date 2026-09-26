@@ -38,6 +38,8 @@ import {
 	DEFAULT_FILENAME_TEMPLATE,
 	DEFAULT_SETTINGS,
 	MeetingSession,
+	GITHUB_REPO,
+	GITHUB_URL,
 	mmt,
 	newSession,
 	ScuttlebuttSettings,
@@ -291,11 +293,17 @@ export default class ScuttlebuttPlugin extends Plugin {
 			await this.saveSettings();
 			try {
 				const res = await requestUrl({
-					url: 'https://api.github.com/repos/qkm2000/Scuttlebutt/releases/latest',
+					url: `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`,
 					headers: { Accept: 'application/vnd.github+json' },
 					throw: false,
 				});
-				const data: unknown = res.json;
+				if (res.status === 404) {
+					// No release published (yet) — forget any version remembered from
+					// an earlier source so a stale value can't keep nagging.
+					s.latestKnownVersion = '';
+					await this.saveSettings();
+				}
+				const data: unknown = res.status === 200 ? res.json : null;
 				if (isRecord(data)) {
 					const tag = str(data.tag_name).replace(/^v/i, '').trim();
 					if (tag) {
@@ -319,19 +327,18 @@ export default class ScuttlebuttPlugin extends Plugin {
 			const link = f.createEl('a', { text: 'Update', href: '#' });
 			link.addEventListener('click', (e) => {
 				e.preventDefault();
-				this.openCommunityPlugins();
+				this.openReleasePage();
 			});
 		});
 		new Notice(frag, 15000);
 	}
 
-	/** Open Settings -> Community plugins so the user can update from there. */
-	openCommunityPlugins(): void {
-		const setting = (
-			this.app as unknown as { setting?: { open(): void; openTabById(id: string): void } }
-		).setting;
-		setting?.open();
-		setting?.openTabById('community-plugins');
+	/**
+	 * Open the fork's latest GitHub release. Deliberately not Community plugins: updating
+	 * from there would install upstream and drop the fork's features.
+	 */
+	openReleasePage(): void {
+		window.open(`${GITHUB_URL}/releases/latest`);
 	}
 
 	async activateView(): Promise<void> {

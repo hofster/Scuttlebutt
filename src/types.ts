@@ -266,5 +266,11 @@ export function newSession(
 	};
 }
 
+// This is a fork: update checks and links point at the fork, not upstream
+// (qkm2000/Scuttlebutt), so an upstream release never prompts an update that
+// would replace the fork's features.
+export const GITHUB_REPO = 'hofster/Scuttlebutt';
+export const GITHUB_URL = `https://github.com/${GITHUB_REPO}`;
+
 export const VIEW_TYPE_SCUTTLEBUTT = 'scuttlebutt-view';
 export const AUDIO_EXTENSIONS = ['webm', 'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'mp4', 'mpga', 'oga'];
