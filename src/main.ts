@@ -11,7 +11,7 @@
  * Local-first. Everything runs against endpoints you configure. No cloud, no accounts.
  */
 
-import { Notice, Platform, Plugin, TFile, normalizePath, requestUrl } from 'obsidian';
+import { Notice, Platform, Plugin, TFile, TFolder, normalizePath, requestUrl } from 'obsidian';
 import {
 	applyTemplate,
 	calloutBlock,
@@ -211,6 +211,21 @@ export default class ScuttlebuttPlugin extends Plugin {
 					this.activeNoteAudioFiles = await this.findEmbeddedAudioFiles(file);
 					this.refreshViews();
 				}
+			})
+		);
+
+		// No stable Obsidian API reports "the folder currently selected in the sidebar", so
+		// this offers the same outcome the documented way: right-click a folder to start a
+		// recording whose note is created there instead of the configured default folder.
+		this.registerEvent(
+			this.app.workspace.on('file-menu', (menu, file) => {
+				if (!(file instanceof TFolder)) return;
+				menu.addItem((item) =>
+					item
+						.setTitle('Start Scuttlebutt recording here')
+						.setIcon('mic')
+						.onClick(() => void this.startRecordingInFolder(file))
+				);
 			})
 		);
 	}
@@ -423,6 +438,14 @@ export default class ScuttlebuttPlugin extends Plugin {
 		new Notice('Linked to: ' + file.basename);
 	}
 
+	/** Start a fresh recording whose note is created in a specific folder, rather than the
+	 * configured default — used by the "Start Scuttlebutt recording here" folder context-
+	 * menu action, since Obsidian has no stable API for "the folder currently selected in
+	 * the sidebar" to react to implicitly. */
+	async startRecordingInFolder(folder: TFolder): Promise<void> {
+		await this.startRecording(folder.path);
+	}
+
 	/** Push streaming summary/reasoning into open views in place (no full re-render). */
 	private updateStreamingViews(): void {
 		for (const view of this.getViews()) view.updateStreaming();
@@ -463,7 +486,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 		}
 	}
 
-	async startRecording(): Promise<void> {
+	async startRecording(folderOverride?: string): Promise<void> {
 		// Synchronous guard: a second call (double-click, ribbon + command) before the first
 		// resolves would start a concurrent recorder and orphan the first mic stream.
 		if (this.recorder.isActive() || this.startingRecording) return;
@@ -499,6 +522,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 			);
 		}
 		this.session = this.freshSession();
+		if (folderOverride) this.session.targetFolder = folderOverride;
 		this.session.activeMs = 0;
 		this.session.segmentStartedAt = Date.now();
 		this.session.paused = false;
@@ -1380,7 +1404,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 			})
 		);
 		if (file.basename === idealBase) return;
-		const newPath = await this.uniquePath(this.settings.notesFolder, idealBase, 'md');
+		const newPath = await this.uniquePath(s.targetFolder ?? this.settings.notesFolder, idealBase, 'md');
 		try {
 			await this.app.fileManager.renameFile(file, newPath);
 			s.savedNotePath = newPath;
@@ -1391,7 +1415,8 @@ export default class ScuttlebuttPlugin extends Plugin {
 
 	private async writeNote(): Promise<string> {
 		const s = this.session;
-		await this.ensureFolder(this.settings.notesFolder);
+		const notesFolder = s.targetFolder ?? this.settings.notesFolder;
+		await this.ensureFolder(notesFolder);
 
 		const now = new Date();
 		const title = s.title.trim() || 'Meeting';
@@ -1402,8 +1427,7 @@ export default class ScuttlebuttPlugin extends Plugin {
 			})
 		);
 		const existing = s.savedNotePath ? this.app.vault.getAbstractFileByPath(s.savedNotePath) : null;
-		const path =
-			existing instanceof TFile ? existing.path : await this.uniquePath(this.settings.notesFolder, base, 'md');
+		const path = existing instanceof TFile ? existing.path : await this.uniquePath(notesFolder, base, 'md');
 
 		const fm: string[] = ['---'];
 		fm.push('scuttlebutt: true');

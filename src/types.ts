@@ -230,6 +230,9 @@ export interface MeetingSession {
 	// saved), so the ribbon icon and "start fresh" guards should feel free to move on
 	// instead of treating merely having browsed to an old note as "unsaved work".
 	loadedFromNote: boolean;
+	// Folder this meeting's note should be created in, overriding settings.notesFolder —
+	// set via the "Start Scuttlebutt recording here" folder context-menu action.
+	targetFolder: string | null;
 }
 
 export function newSession(
@@ -263,6 +266,7 @@ export function newSession(
 		savedNotePath: null,
 		foreignNote: false,
 		loadedFromNote: false,
+		targetFolder: null,
 	};
 }
 
